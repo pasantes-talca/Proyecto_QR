@@ -43,12 +43,12 @@ SHEETS_API_KEY = "TALCA-QR-2026"  # Debe coincidir con API_KEY en Apps Script
 #   POSTGRES DEFAULTS
 # =======================
 DEFAULT_PG = {
-    "host": os.getenv("TALCA_PG_HOST", "localhost"),
+    "host": os.getenv("TALCA_PG_HOST", "10.242.4.13"),
     "port": int(os.getenv("TALCA_PG_PORT", "5432")),
-    "dbname": os.getenv("TALCA_PG_DB", "postgres"),
-    "user": os.getenv("TALCA_PG_USER", "postgres"),
-    "password": os.getenv("TALCA_PG_PASS", ""),
-    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),  # opcional
+    "dbname": os.getenv("TALCA_PG_DB", "stock"),
+    "user": os.getenv("TALCA_PG_USER", "usuario_stock_app"),
+    "password": os.getenv("TALCA_PG_PASS", "Talca2026"),
+    "client_encoding": os.getenv("TALCA_PG_ENCODING", "WIN1252"),  # opcional
     "schema": "stock",
     "table_products": "productos",
     "table_pp": "stock_pp",
