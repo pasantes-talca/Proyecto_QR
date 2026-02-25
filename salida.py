@@ -62,14 +62,27 @@ DEFAULT_PG = {
 #   CACHE
 # =======================
 def load_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    if not os.path.exists(CACHE_FILE):
+        return {}
 
+    # Leemos como bytes (para no romper por encoding)
+    raw = open(CACHE_FILE, "rb").read()
+
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            txt = raw.decode(enc)
+            data = json.loads(txt)
+
+            # Si se pudo leer, lo re-guardamos en UTF-8 para que no vuelva a pasar
+            with open(CACHE_FILE, "w", encoding="utf-8") as wf:
+                json.dump(data, wf, ensure_ascii=False, indent=2)
+
+            return data
+
+        except UnicodeDecodeError:
+            continue
+
+    raise RuntimeError("No pude decodificar config.json. Guardalo como UTF-8.")
 
 def get_pg_config():
     cfg = DEFAULT_PG.copy()

@@ -1,9 +1,18 @@
+# generacionEimpresion.py
 import os
 import sys
 import json
 import textwrap
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
+
+try:
+    from dateutil.relativedelta import relativedelta
+except ModuleNotFoundError:
+    raise SystemExit(
+        "Falta el paquete 'python-dateutil'.\n"
+        "Instalalo en tu venv con:\n"
+        "  pip install python-dateutil\n"
+    )
 
 import qrcode
 from reportlab.lib.pagesizes import A4
@@ -13,10 +22,6 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog
 
-
-# ----------------------------
-#   POSTGRES DRIVER
-# ----------------------------
 try:
     import psycopg2
 except Exception:
@@ -24,7 +29,7 @@ except Exception:
 
 
 # =======================
-#   CONFIG / PATHS
+#   PATHS / CONFIG
 # =======================
 def get_app_dir():
     if getattr(sys, "frozen", False):
@@ -33,67 +38,75 @@ def get_app_dir():
 
 
 APP_DIR = get_app_dir()
-CACHE_FILE = os.path.join(APP_DIR, "config.json")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
-# =======================
-#   POSTGRES DEFAULTS
-# =======================
+
 DEFAULT_PG = {
     "host": os.getenv("TALCA_PG_HOST", "localhost"),
     "port": int(os.getenv("TALCA_PG_PORT", "5432")),
     "dbname": os.getenv("TALCA_PG_DB", "postgres"),
     "user": os.getenv("TALCA_PG_USER", "postgres"),
     "password": os.getenv("TALCA_PG_PASS", ""),
-    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),  # opcional
-    "schema": "stock",
+    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),  # ej: WIN1252
+    "schema": "produccion",
     "table_products": "productos",
+    "table_stock": "stock",
 }
 
 
-# =======================
-#   CACHE
-# =======================
-def load_cache():
-    if os.path.exists(CACHE_FILE):
+def load_config():
+    if os.path.exists(CONFIG_FILE):
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
             return {}
     return {}
 
 
-def save_cache(data: dict):
+def save_config(data: dict):
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except:
+    except Exception:
         pass
 
 
 def get_pg_config():
     cfg = DEFAULT_PG.copy()
-    cache = load_cache()
-    if isinstance(cache.get("pg"), dict):
-        for k, v in cache["pg"].items():
+    data = load_config()
+    if isinstance(data.get("pg"), dict):
+        for k, v in data["pg"].items():
             if v is not None and v != "":
                 cfg[k] = v
-
     try:
         cfg["port"] = int(cfg["port"])
-    except:
+    except Exception:
         cfg["port"] = 5432
     return cfg
+
+
+def cache_get(key: str, default=None):
+    data = load_config()
+    cache = data.get("cache", {})
+    if isinstance(cache, dict) and key in cache:
+        return cache.get(key, default)
+    return default
+
+
+def cache_set(key: str, value):
+    data = load_config()
+    if not isinstance(data.get("cache"), dict):
+        data["cache"] = {}
+    data["cache"][key] = value
+    save_config(data)
 
 
 # =======================
 #   POSTGRES
 # =======================
 def pg_connect():
-    """
-    Conecta a PostgreSQL usando config.json (sección pg)
-    Aplica client_encoding si está definido (ej: WIN1252)
-    """
     if psycopg2 is None:
         raise RuntimeError("Falta psycopg2. Instalá con: pip install psycopg2-binary")
 
@@ -109,79 +122,87 @@ def pg_connect():
 
     enc = cfg.get("client_encoding")
     if enc:
-        try:
-            conn.set_client_encoding(enc)
-        except Exception as e:
-            raise RuntimeError(f"Conectó a PG pero falló client_encoding='{enc}': {e}")
+        conn.set_client_encoding(enc)
 
     return conn
 
 
 def fetch_products(conn):
+    """
+    ✅ NUEVA BD:
+      produccion.productos(id, descripcion)
+    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     prod = cfg["table_products"]
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT id_producto, descripcion
+            SELECT id, descripcion
             FROM {schema}.{prod}
             ORDER BY descripcion ASC;
         """)
-        return cur.fetchall()
+        return cur.fetchall()  # [(id, descripcion), ...]
 
 
-def get_product_row(conn, id_producto: int):
+def get_db_max_serie_for_lote(conn, id_producto: int, lote: str) -> int:
+    """
+    Busca el máximo nro_serie ya ingresado en produccion.stock para ese producto+lote.
+    Si todavía no hay ingresos, devuelve 0.
+    """
     cfg = get_pg_config()
     schema = cfg["schema"]
-    prod = cfg["table_products"]
+    tstock = cfg["table_stock"]
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT id_producto, descripcion, ultimo_nro_serie
-            FROM {schema}.{prod}
-            WHERE id_producto = %s;
-        """, (int(id_producto),))
-        return cur.fetchone()
+            SELECT COALESCE(MAX(nro_serie), 0)
+            FROM {schema}.{tstock}
+            WHERE id_producto = %s AND lote = %s;
+        """, (int(id_producto), str(lote)))
+        return int(cur.fetchone()[0] or 0)
 
 
-def update_ultimo_nro_serie(conn, id_producto: int, ultimo: int):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    prod = cfg["table_products"]
+def get_starting_serie(conn, id_producto: int, lote: str) -> int:
+    """
+    Evita duplicados:
+    - max en DB (lo ya escaneado/ingresado)
+    - max en cache local (lo ya generado en esta PC aunque todavía no escaneado)
 
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            UPDATE {schema}.{prod}
-            SET ultimo_nro_serie = %s
-            WHERE id_producto = %s;
-        """, (int(ultimo), int(id_producto)))
+    Arranca desde el mayor de ambos.
+    """
+    db_max = get_db_max_serie_for_lote(conn, id_producto, lote)
+    cache_key = f"gen_ultimo_serie::{id_producto}::{lote}"
+    cache_max = int(cache_get(cache_key, 0) or 0)
+    return max(db_max, cache_max)
+
+
+def set_last_generated(id_producto: int, lote: str, ultimo: int):
+    cache_key = f"gen_ultimo_serie::{id_producto}::{lote}"
+    cache_set(cache_key, int(ultimo))
 
 
 # =======================
-#   PDF QRS
+#   PDF / QR
 # =======================
 def dividir_texto(texto, max_caracteres):
     return textwrap.wrap(str(texto), width=max_caracteres)
 
 
 def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: int):
-    row = get_product_row(conn, id_producto)
-    if not row:
-        messagebox.showerror("Error", "Producto no encontrado en Postgres.")
-        return
-
-    _, _, ultimo = row
-    nro_serie = int(ultimo or 0)
-
     fecha_actual = datetime.now()
+
+    # Lote = ddmmyy (igual que antes)
+    numero_lote = fecha_actual.strftime("%d%m%y")
+
     fec_iso = fecha_actual.strftime("%Y-%m-%d")
     vto_iso = (fecha_actual + relativedelta(months=6)).strftime("%Y-%m-%d")
 
     fecha_str = fecha_actual.strftime("%d/%m/%y")
     fecha_venc_str = (fecha_actual + relativedelta(months=6)).strftime("%d/%m/%y")
 
-    numero_lote = fecha_actual.strftime("%d%m%y")
+    # Serie inicial (DB vs cache)
+    nro_serie = get_starting_serie(conn, id_producto, numero_lote)
 
     pdf_path = filedialog.asksaveasfilename(
         defaultextension=".pdf",
@@ -217,10 +238,10 @@ def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: i
         )
 
         qr = qrcode.make(payload_qr)
-        qr_path = os.path.join(APP_DIR, f"temp_qr_{id_producto}_{nro_serie}.png")
+        qr_path = os.path.join(APP_DIR, f"temp_qr_{id_producto}_{numero_lote}_{nro_serie}.png")
         qr.save(qr_path)
 
-        # 2 copias por hoja (tal cual tu lógica)
+        # 2 copias por QR
         for _ in range(2):
             y = y_positions[posicion_actual]
             c.drawImage(qr_path, x_qr, y, width=qr_size, height=qr_size)
@@ -263,65 +284,59 @@ def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: i
 
         try:
             os.remove(qr_path)
-        except:
+        except Exception:
             pass
 
     c.save()
 
-    # actualizar ultimo_nro_serie en Postgres
-    update_ultimo_nro_serie(conn, id_producto, nro_serie)
+    # guardamos en cache el último generado (por producto + lote)
+    set_last_generated(id_producto, numero_lote, nro_serie)
 
-    messagebox.showinfo("PDF generado", f"El archivo se guardó correctamente:\n{pdf_path}")
+    messagebox.showinfo("PDF generado", f"✅ PDF guardado:\n{pdf_path}\n\nLote: {numero_lote}")
 
 
 # =======================
-#   UI APP
+#   UI
 # =======================
 def main():
-    # Conexión PG
     try:
         conn_pg = pg_connect()
     except Exception as e:
-        messagebox.showerror(
-            "PostgreSQL",
-            "No pude conectar a PostgreSQL.\n\n"
-            f"Error: {e}\n\n"
-            "Tip: revisá host/puerto/db/user/pass en config.json (sección pg).\n"
-            "Si usás client_encoding, asegurate que sea válido (ej: WIN1252)."
-        )
+        messagebox.showerror("PostgreSQL", f"No pude conectar a PostgreSQL:\n\n{e}")
         return
 
-    # Carga productos
     try:
         productos = fetch_products(conn_pg)
     except Exception as e:
-        messagebox.showerror("PostgreSQL", f"No pude leer stock.productos.\n\n{e}")
+        messagebox.showerror("PostgreSQL", f"No pude leer produccion.productos:\n\n{e}")
         return
 
-    # UI
     root = tb.Window(themename="minty")
     root.title("Generación e Impresión de QRs – Talca (PostgreSQL)")
-    root.geometry("900x520")
+    root.geometry("920x540")
 
     tb.Label(root, text="Generador de QRs", font=("Segoe UI", 20, "bold")).pack(pady=18)
     tb.Label(root, text="Seleccioná un producto:", font=("Segoe UI", 12)).pack(pady=6)
 
     producto_dict = {f"{desc} (ID: {pid})": (int(pid), str(desc)) for pid, desc in productos}
 
-    combo = tb.Combobox(root, values=list(producto_dict.keys()), width=90)
+    combo = tb.Combobox(root, values=list(producto_dict.keys()), width=92)
     combo.pack(pady=4)
 
     tb.Label(root, text="Cantidad de números de serie:", font=("Segoe UI", 12)).pack(pady=12)
     cantidad_entry = tb.Entry(root, width=12)
     cantidad_entry.pack()
 
-    cache = load_cache()
-    if cache.get("gen_producto") in producto_dict:
-        combo.set(cache.get("gen_producto"))
-    if cache.get("gen_cantidad"):
+    # restaurar UI
+    last_prod = cache_get("ui_gen_producto", "")
+    last_cant = cache_get("ui_gen_cantidad", "")
+
+    if last_prod in producto_dict:
+        combo.set(last_prod)
+    if last_cant:
         try:
-            cantidad_entry.insert(0, str(int(cache.get("gen_cantidad"))))
-        except:
+            cantidad_entry.insert(0, str(int(last_cant)))
+        except Exception:
             pass
 
     def al_hacer_click_generar():
@@ -333,24 +348,22 @@ def main():
             cantidad = int(cantidad_entry.get())
             if cantidad <= 0:
                 raise ValueError
-        except:
+        except Exception:
             messagebox.showwarning("Aviso", "Cantidad inválida.")
             return
 
         pid, desc = producto_dict[combo.get()]
         generar_y_imprimir_qrs(conn_pg, pid, desc, cantidad)
 
-        cache2 = load_cache()
-        cache2["gen_producto"] = combo.get()
-        cache2["gen_cantidad"] = cantidad
-        save_cache(cache2)
+        cache_set("ui_gen_producto", combo.get())
+        cache_set("ui_gen_cantidad", cantidad)
 
     tb.Button(root, text="GENERAR", bootstyle=SUCCESS, command=al_hacer_click_generar).pack(pady=22)
 
     def on_close():
         try:
             conn_pg.close()
-        except:
+        except Exception:
             pass
         root.destroy()
 
