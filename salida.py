@@ -31,7 +31,7 @@ CACHE_FILE = os.path.join(APP_DIR, "config.json")
 
 
 # =======================
-# GOOGLE SHEETS
+# GOOGLE SHEETS (opcional, si lo usas)
 # =======================
 SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbz3HnhMu8ylXKtiEVvcsIRc_VKJzxUQHotKDOHT74QgTgLIVbJPPiX3eJBly368Ad4/exec"
 SHEETS_API_KEY = "TALCA-QR-2026"
@@ -50,7 +50,7 @@ DEFAULT_PG = {
     "schema": "produccion",
     "table_products": "productos",
     "table_stock": "stock",
-    "table_salidas": "salidas_qr",
+    "table_bajas": "productos_bajas",          # tabla donde guardamos bajas con motivo y obs
     "table_ultimo_serie": "ultimo_serie_por_lote",
 }
 
@@ -110,36 +110,37 @@ def init_tables(conn):
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
 
-        # Asegurar columna motivo
+        # Asegurar columnas en productos_bajas (ya las tenés, pero por seguridad)
         cur.execute(f"""
             DO $$
             BEGIN
+                -- motivo
                 IF NOT EXISTS (
                     SELECT 1 FROM information_schema.columns 
                     WHERE table_schema = '{schema}' 
-                      AND table_name = '{cfg['table_salidas']}' 
+                      AND table_name = '{cfg['table_bajas']}' 
                       AND column_name = 'motivo'
                 ) THEN
-                    ALTER TABLE {schema}.{cfg['table_salidas']}
+                    ALTER TABLE {schema}.{cfg['table_bajas']}
                     ADD COLUMN motivo TEXT NOT NULL DEFAULT 'Venta';
+                END IF;
+
+                -- observaciones (opcional)
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_schema = '{schema}' 
+                      AND table_name = '{cfg['table_bajas']}' 
+                      AND column_name = 'observaciones'
+                ) THEN
+                    ALTER TABLE {schema}.{cfg['table_bajas']}
+                    ADD COLUMN observaciones TEXT;
                 END IF;
             END $$;
         """)
 
-        # Tabla ultimo_serie_por_lote
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {schema}.{cfg['table_ultimo_serie']} (
-                id_producto INT NOT NULL,
-                lote TEXT NOT NULL,
-                ultimo_serie INT NOT NULL DEFAULT 0,
-                ultima_actualizacion TIMESTAMPTZ DEFAULT now(),
-                PRIMARY KEY (id_producto, lote)
-            );
-        """)
-
 
 # =======================
-# PARSEO QR (ajusta el formato según tus códigos reales)
+# PARSEO QR (ajusta según tu formato real)
 # =======================
 def parse_qr(raw: str):
     raw = raw.strip()
@@ -168,13 +169,37 @@ def parse_qr(raw: str):
 
 
 # =======================
-# BAJA POR QR (con motivo)
+# REGISTRAR BAJA EN productos_bajas
 # =======================
-def baja_por_qr(conn, id_producto: int, lote: str, nro_serie: int, raw_payload: str, motivo: str):
+def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str, observaciones: str = None, nro_serie: int = None):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    bajas_tbl = cfg["table_bajas"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {schema}.{bajas_tbl} (
+                id_producto,
+                stock_lote,
+                fecha_hora,
+                cantidad,
+                motivo,
+                observaciones
+            ) VALUES (
+                %s, %s, NOW(), %s, %s, %s
+            ) RETURNING id;
+        """, (id_producto, lote, cantidad, motivo, observaciones or None))
+        return cur.fetchone()[0]
+
+
+# =======================
+# BAJA POR QR (con motivo y observaciones)
+# =======================
+def baja_por_qr(conn, id_producto: int, lote: str, nro_serie: int, raw_payload: str, motivo: str, observaciones: str = None):
     cfg = get_pg_config()
     schema = cfg["schema"]
     stock_tbl = cfg["table_stock"]
-    salidas_tbl = cfg["table_salidas"]
+    bajas_tbl = cfg["table_bajas"]
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -191,26 +216,13 @@ def baja_por_qr(conn, id_producto: int, lote: str, nro_serie: int, raw_payload: 
         stock_id, inicio, fin, packs_fin = row
         packs_fin = int(packs_fin or 0)
 
-        # Duplicado
-        cur.execute(f"""
-            SELECT 1 FROM {schema}.{salidas_tbl}
-            WHERE id_producto = %s AND lote = %s AND nro_serie = %s
-            LIMIT 1;
-        """, (id_producto, lote, nro_serie))
-        if cur.fetchone():
-            raise ValueError(f"Serie {nro_serie} ya dada de baja")
-
         unit_type = 'packs' if packs_fin > 0 and nro_serie == fin else 'pallet'
-        packs_qty = packs_fin if unit_type == 'packs' else 0
+        cantidad = packs_fin if unit_type == 'packs' else 1
 
-        cur.execute(f"""
-            INSERT INTO {schema}.{salidas_tbl} (
-                id_producto, lote, nro_serie, unit_type, packs_qty, stock_id, raw_payload, motivo
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id;
-        """, (id_producto, lote, nro_serie, unit_type, packs_qty, stock_id, raw_payload, motivo))
-        salida_id = cur.fetchone()[0]
+        # Registrar en productos_bajas
+        registrar_baja(conn, id_producto, lote, cantidad, motivo, observaciones, nro_serie)
 
+        # Ajustar stock (igual que antes)
         if unit_type == 'packs':
             adjust_or_delete_range(conn, stock_id, new_packs_fin=0)
         else:
@@ -222,11 +234,11 @@ def baja_por_qr(conn, id_producto: int, lote: str, nro_serie: int, raw_payload: 
 
         update_ultimo_serie_por_lote(conn, id_producto, lote)
 
-        return salida_id, unit_type, packs_qty
+        return unit_type, cantidad
 
 
 # =======================
-# FUNCIONES AUXILIARES (definidas antes de usarlas)
+# DROPDOWNS
 # =======================
 def get_products_with_stock(conn):
     cfg = get_pg_config()
@@ -260,7 +272,7 @@ def compute_net_stock(conn, id_producto: int, lote: str):
     cfg = get_pg_config()
     schema = cfg["schema"]
     stock_tbl = cfg["table_stock"]
-    salidas_tbl = cfg["table_salidas"]
+    bajas_tbl = cfg["table_bajas"]
     prod_tbl = cfg["table_products"]
 
     with conn.cursor() as cur:
@@ -278,34 +290,21 @@ def compute_net_stock(conn, id_producto: int, lote: str):
 
         cur.execute(f"""
             SELECT 
-                COALESCE(SUM(CASE WHEN unit_type = 'pallet' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN unit_type = 'packs' THEN packs_qty ELSE 0 END), 0)
-            FROM {schema}.{salidas_tbl}
-            WHERE id_producto = %s AND lote = %s;
+                COALESCE(SUM(cantidad), 0)
+            FROM {schema}.{bajas_tbl}
+            WHERE id_producto = %s AND stock_lote = %s;
         """, (id_producto, lote))
-        out_pallets, out_packs = cur.fetchone() or (0, 0)
+        total_bajas = cur.fetchone()[0] or 0
 
-    return in_pallets - out_pallets, in_packs - out_packs, desc
+    # Nota: si las bajas son por unidad, el neto es in - total_bajas
+    # Ajusta según tu lógica real de cálculo
+    net_total = in_pallets + in_packs - total_bajas  # simplificado, cámbialo si usas pallets/packs separados
 
-
-def build_payload_for_product_lote_net(conn, id_producto: int, lote: str):
-    net_p, net_pk, desc = compute_net_stock(conn, id_producto, lote)
-    return {
-        "api_key": SHEETS_API_KEY,
-        "type": "scan_pp",
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "stock": {
-            "id_producto": id_producto,
-            "descripcion": desc,
-            "lote": lote,
-            "stock_pallets": net_p,
-            "stock_packs": net_pk,
-        }
-    }
+    return net_total, desc
 
 
 # =======================
-# UI CON MOTIVOS + LECTOR QR
+# UI COMPLETA
 # =======================
 def main():
     try:
@@ -317,11 +316,11 @@ def main():
 
     root = tb.Window(themename="minty")
     root.title("Baja por QR / Manual – Talca")
-    root.geometry("1000x750")
+    root.geometry("1100x800")
 
     tb.Label(root, text="Baja por QR o Manual", font=("Segoe UI", 22, "bold")).pack(pady=16)
 
-    # Selección de motivo (siempre vuelve a Venta)
+    # Motivo (siempre vuelve a Venta)
     motivo_var = tb.StringVar(value="Venta")
     frame_motivo = tb.Frame(root)
     frame_motivo.pack(pady=8)
@@ -329,6 +328,12 @@ def main():
     tb.Radiobutton(frame_motivo, text="Venta", variable=motivo_var, value="Venta").pack(side="left", padx=10)
     tb.Radiobutton(frame_motivo, text="Calidad", variable=motivo_var, value="Calidad").pack(side="left", padx=10)
     tb.Radiobutton(frame_motivo, text="Desarme", variable=motivo_var, value="Desarme").pack(side="left", padx=10)
+
+    # Observaciones (opcional)
+    tb.Label(root, text="Observaciones (opcional):", font=("Segoe UI", 12)).pack(pady=4)
+    obs_var = tb.StringVar()
+    obs_entry = tb.Entry(root, textvariable=obs_var, width=90, font=("Segoe UI", 12))
+    obs_entry.pack(pady=4)
 
     # Modo QR
     tb.Label(root, text="Modo QR: Escanea con pistola lectora", font=("Segoe UI", 14)).pack(pady=12)
@@ -363,14 +368,15 @@ def main():
     cant_var = tb.StringVar()
     tb.Entry(frame_manual, textvariable=cant_var, width=12).grid(row=3, column=1, sticky="w", padx=12)
 
-    btn_manual = tb.Button(root, text="EJECUTAR BAJA MANUAL", bootstyle=WARNING, width=25, command=lambda: on_manual_baja(motivo_var.get()))
+    btn_manual = tb.Button(root, text="EJECUTAR BAJA MANUAL", bootstyle=WARNING, width=25, command=lambda: on_manual_baja(motivo_var.get(), obs_var.get()))
     btn_manual.pack(pady=16)
 
     status_var = tb.StringVar(value="🟢 Listo – escanea QR o usa manual (motivo por default: Venta)")
     tb.Label(root, textvariable=status_var, font=("Segoe UI", 12), wraplength=900, justify="left").pack(pady=12, padx=40)
 
-    def reset_motivo():
+    def reset_form():
         motivo_var.set("Venta")
+        obs_var.set("")
 
     def on_qr_scan(event=None):
         raw = qr_var.get().strip()
@@ -386,27 +392,30 @@ def main():
             nserie = qr_data['nro_serie']
 
             motivo = motivo_var.get()
-            salida_id, unit_type, qty = baja_por_qr(conn, pid, lote, nserie, raw, motivo)
+            obs = obs_var.get().strip() or None
+
+            unit_type, cantidad = baja_por_qr(conn, pid, lote, nserie, raw, motivo, obs)
 
             net_p, net_pk, desc = compute_net_stock(conn, pid, lote)
 
             status_var.set(
                 f"✅ Baja por QR registrada\n"
                 f"Motivo: {motivo}\n"
+                f"Observaciones: {obs if obs else 'Ninguna'}\n"
                 f"Producto: {pid} - {desc}\n"
                 f"Lote: {lote} | Serie: {nserie}\n"
-                f"Tipo: {unit_type} | Cantidad: {qty}\n"
+                f"Tipo: {unit_type} | Cantidad: {cantidad}\n"
                 f"Stock neto → Pallets: {net_p} | Packs: {net_pk}"
             )
 
-            reset_motivo()  # Siempre vuelve a Venta
+            reset_form()
 
         except Exception as e:
             status_var.set(f"❌ ERROR en QR: {str(e)}")
 
     qr_entry.bind("<Return>", on_qr_scan)
 
-    def on_manual_baja(motivo):
+    def on_manual_baja(motivo, obs):
         try:
             pstr = prod_var.get()
             if not pstr: raise ValueError("Selecciona producto")
@@ -421,8 +430,10 @@ def main():
             qty = int(qty_str)
             if qty <= 0: raise ValueError("Cantidad > 0")
 
-            # Aquí llamas a eliminar_batch_ultimos (tu función manual)
-            # Ejemplo (adapta si tu función es diferente):
+            # Registrar baja manual en productos_bajas
+            registrar_baja(conn, pid, lote, qty, motivo, obs.strip() or None)
+
+            # Ajustar stock (tu función existente)
             ids, new_serie, desc = eliminar_batch_ultimos(conn, pid, lote, tipo, qty)
 
             net_p, net_pk, _ = compute_net_stock(conn, pid, lote)
@@ -430,6 +441,7 @@ def main():
             status_var.set(
                 f"✅ Baja manual registrada\n"
                 f"Motivo: {motivo}\n"
+                f"Observaciones: {obs if obs else 'Ninguna'}\n"
                 f"Producto: {pid} - {desc}\n"
                 f"Lote: {lote}\n"
                 f"Ajustado: {qty} {tipo}\n"
@@ -437,7 +449,7 @@ def main():
                 f"Stock neto → Pallets: {net_p} | Packs: {net_pk}"
             )
 
-            reset_motivo()  # Vuelve a Venta
+            reset_form()
             cant_var.set("")
 
         except Exception as e:
