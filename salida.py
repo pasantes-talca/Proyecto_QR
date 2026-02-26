@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-from datetime import datetime
 import urllib.request
 import urllib.error
 
@@ -9,19 +8,14 @@ import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from tkinter import messagebox
 
-# ----------------------------
-#   POSTGRES DRIVER
-# ----------------------------
 try:
     import psycopg2
-    from psycopg2.extras import Json
 except Exception:
     psycopg2 = None
-    Json = None
 
 
 # =======================
-#   CONFIG / PATHS
+#   PATHS / CONFIG
 # =======================
 def get_app_dir():
     if getattr(sys, "frozen", False):
@@ -30,68 +24,50 @@ def get_app_dir():
 
 
 APP_DIR = get_app_dir()
-CACHE_FILE = os.path.join(APP_DIR, "config.json")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 
-# =======================
-#   GOOGLE SHEETS (WEBHOOK)
-# =======================
-SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbz3HnhMu8ylXKtiEVvcsIRc_VKJzxUQHotKDOHT74QgTgLIVbJPPiX3eJBly368Ad4/exec"
-SHEETS_API_KEY = "TALCA-QR-2026"  # Debe coincidir con API_KEY en Apps Script
-
-
-# =======================
-#   POSTGRES DEFAULTS
-# =======================
 DEFAULT_PG = {
     "host": os.getenv("TALCA_PG_HOST", "localhost"),
     "port": int(os.getenv("TALCA_PG_PORT", "5432")),
     "dbname": os.getenv("TALCA_PG_DB", "postgres"),
     "user": os.getenv("TALCA_PG_USER", "postgres"),
     "password": os.getenv("TALCA_PG_PASS", ""),
-    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),  # opcional
-    "schema": "stock",
+    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),
+    "schema": "produccion",
     "table_products": "productos",
-    "table_pp": "stock_pp",
-    "table_outbox": "sheets_outbox",
-    "table_salidas": "salidas_qr",
+    "table_stock": "stock",
+    "table_bajas": "productos_bajas",
+    "table_sheet": "sheet",
 }
 
-
 # =======================
-#   CACHE
+#   GOOGLE SHEET WEBAPP
 # =======================
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
-        return {}
+# Si querés moverlo a config.json:
+# "sheet": {"webapp_url":"...", "api_key":"..."}
+SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwwzMiTB7DEbcOdvi5Vl32xF-McguAlgkzcBQoeAGhzlowc5J1PjF1QLChNcukf5fbn/exec"
+SHEETS_API_KEY = "TALCA-QR-2026"
 
-    # Leemos como bytes (para no romper por encoding)
-    raw = open(CACHE_FILE, "rb").read()
 
-    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+def load_config():
+    if os.path.exists(CONFIG_FILE):
         try:
-            txt = raw.decode(enc)
-            data = json.loads(txt)
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
-            # Si se pudo leer, lo re-guardamos en UTF-8 para que no vuelva a pasar
-            with open(CACHE_FILE, "w", encoding="utf-8") as wf:
-                json.dump(data, wf, ensure_ascii=False, indent=2)
-
-            return data
-
-        except UnicodeDecodeError:
-            continue
-
-    raise RuntimeError("No pude decodificar config.json. Guardalo como UTF-8.")
 
 def get_pg_config():
     cfg = DEFAULT_PG.copy()
-    cache = load_cache()
-    if isinstance(cache.get("pg"), dict):
-        for k, v in cache["pg"].items():
+    data = load_config()
+    if isinstance(data.get("pg"), dict):
+        for k, v in data["pg"].items():
             if v is not None and v != "":
                 cfg[k] = v
-
     try:
         cfg["port"] = int(cfg["port"])
     except Exception:
@@ -99,45 +75,15 @@ def get_pg_config():
     return cfg
 
 
-# =======================
-#   NORMALIZACIONES
-# =======================
-def normalize_id_value(x) -> str:
-    if x is None:
-        return ""
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return ""
-    try:
-        f = float(s)
-        if f.is_integer():
-            return str(int(f))
-    except Exception:
-        pass
-    return s
+def get_sheet_settings():
+    data = load_config()
+    sheet = data.get("sheet") if isinstance(data.get("sheet"), dict) else {}
+    url = sheet.get("webapp_url") or SHEETS_WEBAPP_URL
+    api_key = sheet.get("api_key") or SHEETS_API_KEY
+    return url, api_key
 
 
-def normalize_date_iso(s: str) -> str:
-    if not s:
-        return ""
-    s = str(s).strip()
-    if "/" in s:
-        try:
-            d = datetime.strptime(s, "%d/%m/%y").date()
-            return d.isoformat()
-        except Exception:
-            return s
-    return s
-
-
-# =======================
-#   POSTGRES
-# =======================
 def pg_connect():
-    """
-    Conecta a PostgreSQL usando config.json (sección pg)
-    Aplica client_encoding si está definido (ej: WIN1252)
-    """
     if psycopg2 is None:
         raise RuntimeError("Falta psycopg2. Instalá con: pip install psycopg2-binary")
 
@@ -150,112 +96,117 @@ def pg_connect():
         password=cfg["password"],
     )
     conn.autocommit = True
-
     enc = cfg.get("client_encoding")
     if enc:
-        try:
-            conn.set_client_encoding(enc)
-        except Exception as e:
-            raise RuntimeError(f"Conectó a PG pero falló client_encoding='{enc}': {e}")
-
+        conn.set_client_encoding(enc)
     return conn
 
 
 def init_tables(conn):
     """
-    - Crea schema si no existe
-    - Crea outbox para Sheets (misma usada por escaner.py)
-    - Crea tabla de salidas por QR (marca de baja)
+    Asegura columnas necesarias en productos_bajas:
+      motivo, observaciones, tipo_unidad
+    (NO crea nro_serie porque vos lo eliminaste.)
     """
     cfg = get_pg_config()
     schema = cfg["schema"]
-    outbox = cfg["table_outbox"]
-    salidas = cfg["table_salidas"]
+    tbajas = cfg["table_bajas"]
 
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
 
-        # outbox (cola) para reintentos de Sheets
+        # motivo
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {schema}.{outbox} (
-                id BIGSERIAL PRIMARY KEY,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = '{schema}'
+                      AND table_name = '{tbajas}'
+                      AND column_name = 'motivo'
+                ) THEN
+                    ALTER TABLE {schema}.{tbajas}
+                    ADD COLUMN motivo TEXT NOT NULL DEFAULT 'Venta';
+                END IF;
+            END $$;
         """)
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{outbox}_created_at ON {schema}.{outbox}(created_at DESC);")
 
-        # tabla de salidas (cada QR dado de baja queda registrado acá)
+        # observaciones
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {schema}.{salidas} (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                id_producto INT NOT NULL,
-                lote TEXT NOT NULL,
-                nro_serie INT NOT NULL,
-                unit_type TEXT NOT NULL,         -- 'pallet' o 'packs'
-                packs_qty INT NOT NULL DEFAULT 0,
-                stock_pp_id BIGINT NULL,
-                raw_payload TEXT NULL,
-                CONSTRAINT uq_{salidas}_qr UNIQUE (id_producto, lote, nro_serie)
-            );
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = '{schema}'
+                      AND table_name = '{tbajas}'
+                      AND column_name = 'observaciones'
+                ) THEN
+                    ALTER TABLE {schema}.{tbajas}
+                    ADD COLUMN observaciones TEXT;
+                END IF;
+            END $$;
         """)
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{salidas}_prod_lote ON {schema}.{salidas}(id_producto, lote);")
+
+        # tipo_unidad (PALLET / PACKS)
+        cur.execute(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = '{schema}'
+                      AND table_name = '{tbajas}'
+                      AND column_name = 'tipo_unidad'
+                ) THEN
+                    ALTER TABLE {schema}.{tbajas}
+                    ADD COLUMN tipo_unidad TEXT;
+                END IF;
+            END $$;
+        """)
 
 
 # =======================
-#   SHEETS OUTBOX
+#   QR PARSER
 # =======================
-def outbox_count(conn):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    outbox = cfg["table_outbox"]
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {schema}.{outbox};")
-        return int(cur.fetchone()[0] or 0)
+def parse_qr_payload(raw: str) -> dict:
+    """
+    Formato esperado:
+      NS=000001|PRD=4910|DSC=...|LOT=240226|FEC=...|VTO=...
+    """
+    raw = raw.strip()
+    if "|" in raw and "=" in raw:
+        parts = raw.split("|")
+        data = {}
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                data[k.strip().upper()] = v.strip()
+
+        if not data.get("NS") or not data.get("PRD") or not data.get("LOT"):
+            raise ValueError("QR inválido: faltan campos (Número de serie / Identificador de producto / Lote).")
+
+        return {
+            "nro_serie": int(data["NS"]),
+            "id_producto": int(data["PRD"]),
+            "lote": str(data["LOT"]).strip(),
+        }
+
+    raise ValueError("QR inválido: formato no reconocido.")
 
 
-def queue_outbox(conn, payload: dict):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    outbox = cfg["table_outbox"]
-    with conn.cursor() as cur:
-        cur.execute(f"INSERT INTO {schema}.{outbox}(payload) VALUES (%s);", (Json(payload),))
-
-
-def pop_outbox_batch(conn, limit=50):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    outbox = cfg["table_outbox"]
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT id, payload
-            FROM {schema}.{outbox}
-            ORDER BY id ASC
-            LIMIT %s;
-        """, (int(limit),))
-        return cur.fetchall()
-
-
-def delete_outbox_id(conn, rid: int):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    outbox = cfg["table_outbox"]
-    with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {schema}.{outbox} WHERE id = %s;", (int(rid),))
-
-
-def send_to_sheets(payload: dict):
+# =======================
+#   GOOGLE SHEET SYNC
+# =======================
+def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
+    url, _ = get_sheet_settings()
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        SHEETS_WEBAPP_URL,
+        url,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             txt = resp.read().decode("utf-8", errors="ignore")
             try:
                 return json.loads(txt)
@@ -266,342 +217,495 @@ def send_to_sheets(payload: dict):
             body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        raise RuntimeError(f"HTTP {e.code}: {body or e.reason}")
+        return {"ok": False, "http_status": getattr(e, "code", None), "error": str(e), "raw": body}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
-def flush_outbox(conn):
-    rows = pop_outbox_batch(conn, limit=50)
-    sent = 0
-    for rid, payload in rows:
-        res = send_to_sheets(payload)
-        if isinstance(res, dict) and res.get("ok") is True:
-            delete_outbox_id(conn, rid)
-            sent += 1
-        else:
-            break
-    return sent
-
-
-# =======================
-#   PARSEO QR
-# =======================
-def parse_qr_payload(raw: str) -> dict:
-    """
-    Formato:
-    NS=000001|PRD=12|DSC=Descripcion...|LOT=090226|FEC=2026-02-09|VTO=2026-08-09
-    """
-    raw = raw.strip()
-
-    if "|" in raw and "=" in raw:
-        parts = raw.split("|")
-        data = {}
-        for p in parts:
-            if "=" in p:
-                k, v = p.split("=", 1)
-                data[k.strip()] = v.strip()
-
-        required = ["NS", "PRD", "DSC", "LOT", "FEC", "VTO"]
-        missing = [k for k in required if k not in data or not data[k]]
-        if missing:
-            raise ValueError(f"QR inválido, faltan campos: {', '.join(missing)}")
-
-        return {
-            "descripcion": data["DSC"],
-            "nro_serie": int(data["NS"]),
-            "id_producto": int(normalize_id_value(data["PRD"])),
-            "lote": str(data["LOT"]).strip(),
-            "creacion": normalize_date_iso(data["FEC"]),
-            "vencimiento": normalize_date_iso(data["VTO"]),
-        }
-
-    raise ValueError("QR inválido: formato no reconocido.")
+def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int) -> dict:
+    _, api_key = get_sheet_settings()
+    payload = {
+        "api_key": api_key,
+        "action": "scan_pp",
+        "type": "scan_pp",
+        "descripcion": str(descripcion),
+        "stock_pallets": int(pallets),
+        "stock_packs": int(packs),
+    }
+    return _post_json_to_webapp(payload, timeout=20)
 
 
 # =======================
-#   LÓGICA DE STOCK (INGRESO - SALIDA)
+#   DB HELPERS
 # =======================
-def find_stock_pp_row_for_serial(conn, id_producto: int, lote: str, nro_serie: int):
-    """
-    Busca el movimiento de ingreso (stock_pp) donde cayó ese nro_serie
-    """
+def get_product_desc(conn, id_producto: int) -> str:
     cfg = get_pg_config()
     schema = cfg["schema"]
-    tpp = cfg["table_pp"]
-
+    tprod = cfg["table_products"]
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT id, serie_inicio, serie_fin, packs_fin
-            FROM {schema}.{tpp}
-            WHERE id_producto = %s
-              AND lote = %s
-              AND serie_inicio <= %s
-              AND serie_fin >= %s
-            ORDER BY created_at ASC
-            LIMIT 1;
-        """, (int(id_producto), str(lote), int(nro_serie), int(nro_serie)))
-        return cur.fetchone()  # (id, serie_inicio, serie_fin, packs_fin) o None
-
-
-def compute_ingresos_totals(conn, id_producto: int, lote: str):
-    """
-    Ingresos:
-      pallets = SUM( (serie_fin-serie_inicio+1) - (packs_fin>0 ? 1 : 0) )
-      packs   = SUM(packs_fin)
-    """
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tpp = cfg["table_pp"]
-    prod = cfg["table_products"]
-
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT descripcion FROM {schema}.{prod} WHERE id_producto = %s;", (int(id_producto),))
+        cur.execute(f"SELECT descripcion FROM {schema}.{tprod} WHERE id=%s;", (int(id_producto),))
         row = cur.fetchone()
-        desc = row[0] if row else ""
+        return str(row[0]).strip() if row and row[0] else "Sin descripción"
 
+
+def get_products_with_stock(conn):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+    tprod = cfg["table_products"]
+    with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT
-                COALESCE(SUM((serie_fin - serie_inicio + 1) - CASE WHEN packs_fin > 0 THEN 1 ELSE 0 END), 0) AS pallets,
-                COALESCE(SUM(packs_fin), 0) AS packs
-            FROM {schema}.{tpp}
-            WHERE id_producto = %s AND lote = %s;
-        """, (int(id_producto), str(lote)))
-        pallets, packs = cur.fetchone()
-
-    return int(pallets), int(packs), str(desc).strip()
+            SELECT DISTINCT p.id, p.descripcion
+            FROM {schema}.{tprod} p
+            JOIN {schema}.{tstock} s ON s.id_producto = p.id
+            ORDER BY p.id ASC;
+        """)
+        return cur.fetchall()
 
 
-def compute_salidas_totals(conn, id_producto: int, lote: str):
+def get_lotes_for_product(conn, id_producto: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT DISTINCT lote
+            FROM {schema}.{tstock}
+            WHERE id_producto=%s
+            ORDER BY lote ASC;
+        """, (int(id_producto),))
+        return [r[0] for r in cur.fetchall()]
+
+
+def qr_exists_in_stock(conn, id_producto: int, lote: str, nro_serie: int):
     """
-    Salidas:
-      pallets = COUNT(unit_type='pallet')
-      packs   = SUM(packs_qty) para unit_type='packs'
+    Verifica que el QR exista en stock (modelo por fila/serie).
+    Devuelve (tipo_unidad, packs) o None.
     """
     cfg = get_pg_config()
     schema = cfg["schema"]
-    salidas = cfg["table_salidas"]
+    tstock = cfg["table_stock"]
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT
-                COALESCE(SUM(CASE WHEN unit_type = 'pallet' THEN 1 ELSE 0 END), 0) AS pallets_out,
-                COALESCE(SUM(CASE WHEN unit_type = 'packs' THEN packs_qty ELSE 0 END), 0) AS packs_out
-            FROM {schema}.{salidas}
-            WHERE id_producto = %s AND lote = %s;
-        """, (int(id_producto), str(lote)))
-        pallets_out, packs_out = cur.fetchone()
-
-    return int(pallets_out), int(packs_out)
-
-
-def compute_net_stock(conn, id_producto: int, lote: str):
-    in_p, in_pk, desc = compute_ingresos_totals(conn, id_producto, lote)
-    out_p, out_pk = compute_salidas_totals(conn, id_producto, lote)
-    net_p = in_p - out_p
-    net_pk = in_pk - out_pk
-    return net_p, net_pk, desc
-
-
-def salida_already_done(conn, id_producto: int, lote: str, nro_serie: int) -> bool:
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    salidas = cfg["table_salidas"]
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT 1
-            FROM {schema}.{salidas}
-            WHERE id_producto = %s AND lote = %s AND nro_serie = %s
+            SELECT tipo_unidad, COALESCE(packs,0)
+            FROM {schema}.{tstock}
+            WHERE id_producto=%s AND lote=%s AND nro_serie=%s
             LIMIT 1;
         """, (int(id_producto), str(lote), int(nro_serie)))
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        if not row:
+            return None
+        return (str(row[0]).upper().strip(), int(row[1] or 0))
 
 
-def insert_salida(conn, id_producto: int, lote: str, nro_serie: int, unit_type: str, packs_qty: int, stock_pp_id: int, raw_payload: str):
+def compute_net_available_lote(conn, id_producto: int, lote: str):
+    """
+    Neto disponible por LOTE:
+      pallets_net = count(PALLET en stock lote) - sum(bajas PALLET lote)
+      packs_net   = sum(packs en stock lote)  - sum(bajas PACKS lote)
+    """
     cfg = get_pg_config()
     schema = cfg["schema"]
-    salidas = cfg["table_salidas"]
+    tstock = cfg["table_stock"]
+    tbajas = cfg["table_bajas"]
+
+    with conn.cursor() as cur:
+        # Entradas
+        cur.execute(f"""
+            SELECT COALESCE(COUNT(*),0)
+            FROM {schema}.{tstock}
+            WHERE id_producto=%s AND lote=%s AND tipo_unidad='PALLET';
+        """, (int(id_producto), str(lote)))
+        in_pallets = int(cur.fetchone()[0] or 0)
+
+        cur.execute(f"""
+            SELECT COALESCE(SUM(COALESCE(packs,0)),0)
+            FROM {schema}.{tstock}
+            WHERE id_producto=%s AND lote=%s AND tipo_unidad='PACKS';
+        """, (int(id_producto), str(lote)))
+        in_packs = int(cur.fetchone()[0] or 0)
+
+        # Bajas
+        cur.execute(f"""
+            SELECT COALESCE(SUM(cantidad),0)
+            FROM {schema}.{tbajas}
+            WHERE id_producto=%s AND stock_lote=%s
+              AND (tipo_unidad='PALLET' OR tipo_unidad IS NULL);
+        """, (int(id_producto), str(lote)))
+        out_pallets = int(cur.fetchone()[0] or 0)
+
+        cur.execute(f"""
+            SELECT COALESCE(SUM(cantidad),0)
+            FROM {schema}.{tbajas}
+            WHERE id_producto=%s AND stock_lote=%s
+              AND tipo_unidad='PACKS';
+        """, (int(id_producto), str(lote)))
+        out_packs = int(cur.fetchone()[0] or 0)
+
+    return max(in_pallets - out_pallets, 0), max(in_packs - out_packs, 0)
+
+
+def compute_net_totals_product(conn, id_producto: int):
+    """
+    Neto por PRODUCTO (todos los lotes):
+      net_pallets = count(PALLET stock) - sum(bajas PALLET)
+      net_packs   = sum(packs stock)    - sum(bajas PACKS)
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+    tbajas = cfg["table_bajas"]
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            INSERT INTO {schema}.{salidas}(id_producto, lote, nro_serie, unit_type, packs_qty, stock_pp_id, raw_payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING id, created_at;
-        """, (int(id_producto), str(lote), int(nro_serie), str(unit_type), int(packs_qty), stock_pp_id, raw_payload))
-        return cur.fetchone()  # (id, created_at)
+            SELECT COALESCE(COUNT(*),0)
+            FROM {schema}.{tstock}
+            WHERE id_producto=%s AND tipo_unidad='PALLET';
+        """, (int(id_producto),))
+        in_pallets = int(cur.fetchone()[0] or 0)
+
+        cur.execute(f"""
+            SELECT COALESCE(SUM(COALESCE(packs,0)),0)
+            FROM {schema}.{tstock}
+            WHERE id_producto=%s AND tipo_unidad='PACKS';
+        """, (int(id_producto),))
+        in_packs = int(cur.fetchone()[0] or 0)
+
+        cur.execute(f"""
+            SELECT COALESCE(SUM(cantidad),0)
+            FROM {schema}.{tbajas}
+            WHERE id_producto=%s
+              AND (tipo_unidad='PALLET' OR tipo_unidad IS NULL);
+        """, (int(id_producto),))
+        out_pallets = int(cur.fetchone()[0] or 0)
+
+        cur.execute(f"""
+            SELECT COALESCE(SUM(cantidad),0)
+            FROM {schema}.{tbajas}
+            WHERE id_producto=%s
+              AND tipo_unidad='PACKS';
+        """, (int(id_producto),))
+        out_packs = int(cur.fetchone()[0] or 0)
+
+    return max(in_pallets - out_pallets, 0), max(in_packs - out_packs, 0)
 
 
-def build_payload_for_product_lote_net(conn, id_producto: int, lote: str):
-    net_p, net_pk, desc = compute_net_stock(conn, id_producto, lote)
-    return {
-        "api_key": SHEETS_API_KEY,
-        "type": "scan_pp",  # mantenemos el mismo tipo para no tocar Apps Script
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "stock": {
-            "id_producto": int(id_producto),
-            "descripcion": desc,
-            "lote": str(lote),
-            "stock_pallets": int(net_p),
-            "stock_packs": int(net_pk),
-        }
-    }
+def upsert_sheet(conn, id_producto: int, stock_pallets: int, stock_packs: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tsheet = cfg["table_sheet"]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {schema}.{tsheet}(id_producto, stock_pallets, stock_packs)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (id_producto)
+            DO UPDATE SET stock_pallets = EXCLUDED.stock_pallets,
+                          stock_packs   = EXCLUDED.stock_packs;
+            """,
+            (int(id_producto), int(stock_pallets), int(stock_packs))
+        )
+
+
+def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str,
+                   observaciones: str = None, tipo_unidad: str = None):
+    """
+    Inserta SOLO en productos_bajas (sin nro_serie).
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tbajas = cfg["table_bajas"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {schema}.{tbajas} (
+                id_producto,
+                stock_lote,
+                fecha_hora,
+                cantidad,
+                motivo,
+                observaciones,
+                tipo_unidad
+            ) VALUES (
+                %s, %s, NOW(), %s, %s, %s, %s
+            )
+            RETURNING id;
+        """, (
+            int(id_producto),
+            str(lote),
+            int(cantidad),
+            str(motivo),
+            (observaciones.strip() if observaciones else None),
+            (str(tipo_unidad).upper().strip() if tipo_unidad else None)
+        ))
+        return cur.fetchone()[0]
+
+
+def refresh_sheet_everywhere(conn, id_producto: int):
+    """
+    Recalcula NETO por producto, actualiza:
+      - Postgres: produccion.sheet
+      - Google Sheet: scan_pp (una fila por descripcion)
+    """
+    desc = get_product_desc(conn, id_producto)
+    net_pallets, net_packs = compute_net_totals_product(conn, id_producto)
+
+    upsert_sheet(conn, id_producto, net_pallets, net_packs)
+
+    warn = ""
+    try:
+        res = send_update_row_to_sheet(desc, net_pallets, net_packs)
+        if not (isinstance(res, dict) and res.get("ok") is True):
+            warn = f"⚠️ Google Sheet no confirmó OK: {res}"
+    except Exception as e:
+        warn = f"⚠️ Error al sync con Google Sheet: {e}"
+
+    return net_pallets, net_packs, desc, warn
 
 
 # =======================
-#   UI APP
+#   BAJAS (QR / MANUAL)
+# =======================
+def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
+    """
+    1) Verifica que el QR exista en stock.
+    2) Determina tipo_unidad y cantidad:
+         - PALLET => cantidad = 1
+         - PACKS  => cantidad = packs de esa fila
+    3) Valida contra neto del lote.
+    4) Inserta en productos_bajas.
+    5) Refresca sheet (Postgres + Google Sheet).
+    """
+    qr = parse_qr_payload(raw_payload)
+    pid = int(qr["id_producto"])
+    lote = str(qr["lote"])
+    ns = int(qr["nro_serie"])  # NO se guarda en bajas, se usa solo para validar existencia en stock.
+
+    stock_info = qr_exists_in_stock(conn, pid, lote, ns)
+    if not stock_info:
+        raise ValueError("Ese QR NO existe en STOCK (id_producto + lote + nro_serie).")
+
+    tipo_unidad, packs = stock_info
+    if tipo_unidad == "PACKS":
+        cantidad = packs if packs > 0 else 1
+    else:
+        tipo_unidad = "PALLET"
+        cantidad = 1
+
+    net_pallets_lote, net_packs_lote = compute_net_available_lote(conn, pid, lote)
+    if tipo_unidad == "PALLET" and net_pallets_lote < 1:
+        raise ValueError("No hay PALLETS netos disponibles para ese lote.")
+    if tipo_unidad == "PACKS" and net_packs_lote < cantidad:
+        raise ValueError("No hay PACKS netos disponibles para ese lote.")
+
+    baja_id = registrar_baja(conn, pid, lote, cantidad, motivo, observaciones, tipo_unidad=tipo_unidad)
+    net_pallets, net_packs, desc, warn = refresh_sheet_everywhere(conn, pid)
+
+    return baja_id, pid, desc, lote, ns, tipo_unidad, cantidad, net_pallets, net_packs, warn
+
+
+def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int, motivo: str, observaciones: str = None):
+    """
+    Manual:
+      - tipo pallet/packs
+      - valida contra neto del lote
+      - inserta en productos_bajas
+      - refresca sheet
+    """
+    pid = int(id_producto)
+    lote = str(lote).strip()
+    tipo = (tipo or "").strip().lower()
+    cantidad = int(cantidad)
+
+    if tipo not in ("pallet", "packs"):
+        raise ValueError("Tipo inválido (pallet / packs).")
+    if cantidad <= 0:
+        raise ValueError("Cantidad debe ser > 0.")
+
+    tipo_unidad = "PALLET" if tipo == "pallet" else "PACKS"
+
+    net_pallets_lote, net_packs_lote = compute_net_available_lote(conn, pid, lote)
+    if tipo_unidad == "PALLET" and net_pallets_lote < cantidad:
+        raise ValueError(f"No hay pallets netos suficientes en ese lote. Netos: {net_pallets_lote}")
+    if tipo_unidad == "PACKS" and net_packs_lote < cantidad:
+        raise ValueError(f"No hay packs netos suficientes en ese lote. Netos: {net_packs_lote}")
+
+    baja_id = registrar_baja(conn, pid, lote, cantidad, motivo, observaciones, tipo_unidad=tipo_unidad)
+    net_pallets, net_packs, desc, warn = refresh_sheet_everywhere(conn, pid)
+
+    return baja_id, pid, desc, lote, tipo_unidad, cantidad, net_pallets, net_packs, warn
+
+
+# =======================
+#   UI
 # =======================
 def main():
-    # Conexión PG
     try:
-        conn_pg = pg_connect()
-        init_tables(conn_pg)
+        conn = pg_connect()
+        init_tables(conn)
     except Exception as e:
-        messagebox.showerror(
-            "PostgreSQL",
-            "No pude conectar a PostgreSQL.\n\n"
-            f"Error: {e}\n\n"
-            "Tip: revisá host/puerto/db/user/pass en config.json (sección pg).\n"
-            "Si usás client_encoding, asegurate que sea válido (ej: WIN1252)."
-        )
+        messagebox.showerror("Error PostgreSQL", f"No se pudo conectar:\n{e}")
         return
 
     root = tb.Window(themename="minty")
-    root.title("Salida / Baja por QR – Talca (PostgreSQL)")
-    root.geometry("920x560")
+    root.title("Baja por QR / Manual – Talca")
+    root.geometry("1100x800")
 
-    tb.Label(root, text="Salida / Baja por QR", font=("Segoe UI", 20, "bold")).pack(pady=14)
-    tb.Label(
-        root,
-        text="Escaneá 1 QR y presioná Enter.\n"
-             "El sistema valida que exista en ingreso y lo descuenta del stock.\n"
-             "Si ya estaba dado de baja, lo bloquea.",
-        font=("Segoe UI", 10)
-    ).pack(pady=6)
+    tb.Label(root, text="Baja por QR o Manual", font=("Segoe UI", 22, "bold")).pack(pady=16)
 
-    scan_var = tb.StringVar()
-    entry_scan = tb.Entry(root, textvariable=scan_var, width=95, font=("Segoe UI", 14))
-    entry_scan.pack(pady=12)
-    entry_scan.focus_set()
+    # Motivo
+    motivo_var = tb.StringVar(value="Venta")
+    frame_motivo = tb.Frame(root)
+    frame_motivo.pack(pady=8)
+    tb.Label(frame_motivo, text="Motivo de baja:").pack(side="left", padx=10)
+    tb.Radiobutton(frame_motivo, text="Venta", variable=motivo_var, value="Venta").pack(side="left", padx=10)
+    tb.Radiobutton(frame_motivo, text="Calidad", variable=motivo_var, value="Calidad").pack(side="left", padx=10)
+    tb.Radiobutton(frame_motivo, text="Desarme", variable=motivo_var, value="Desarme").pack(side="left", padx=10)
 
-    status_var = tb.StringVar(value="🟢 Listo: escaneá un QR y Enter.")
-    tb.Label(root, textvariable=status_var, font=("Segoe UI", 11), justify="left").pack(pady=10)
+    # Observaciones
+    tb.Label(root, text="Observaciones (opcional):", font=("Segoe UI", 12)).pack(pady=4)
+    obs_var = tb.StringVar()
+    tb.Entry(root, textvariable=obs_var, width=90, font=("Segoe UI", 12)).pack(pady=4)
 
-    sheets_var = tb.StringVar(value=f"Sheets pendientes (outbox): {outbox_count(conn_pg)}")
-    tb.Label(root, textvariable=sheets_var, font=("Segoe UI", 10)).pack(pady=4)
+    # Modo QR
+    tb.Label(root, text="Modo QR: Escanea con pistola lectora", font=("Segoe UI", 14)).pack(pady=12)
+    qr_var = tb.StringVar()
+    qr_entry = tb.Entry(root, textvariable=qr_var, width=80, font=("Segoe UI", 14))
+    qr_entry.pack(pady=8)
+    qr_entry.focus_set()
 
-    def reset_input():
-        scan_var.set("")
-        entry_scan.focus_set()
+    # Manual
+    tb.Label(root, text="Modo Manual", font=("Segoe UI", 14)).pack(pady=16)
+    frame_manual = tb.Frame(root)
+    frame_manual.pack(pady=8, padx=40, fill="x")
 
-    def on_scan_return(event=None):
-        raw = scan_var.get().strip()
+    tb.Label(frame_manual, text="Producto:").grid(row=0, column=0, sticky="e", padx=12, pady=8)
+    prods = get_products_with_stock(conn)
+    options = [f"{pid} - {desc}" for pid, desc in prods]
+    prod_var = tb.StringVar()
+    prod_combo = tb.Combobox(frame_manual, textvariable=prod_var, values=options, width=60)
+    prod_combo.grid(row=0, column=1, columnspan=3, sticky="w", padx=12, pady=8)
+
+    tb.Label(frame_manual, text="Lote:").grid(row=1, column=0, sticky="e", padx=12, pady=8)
+    lote_var = tb.StringVar()
+    lote_combo = tb.Combobox(frame_manual, textvariable=lote_var, width=30)
+    lote_combo.grid(row=1, column=1, sticky="w", padx=12, pady=8)
+
+    tb.Label(frame_manual, text="Tipo:").grid(row=2, column=0, sticky="e", padx=12, pady=8)
+    type_var = tb.StringVar(value="pallet")
+    tb.Radiobutton(frame_manual, text="Pallets", variable=type_var, value="pallet").grid(row=2, column=1, sticky="w", padx=12)
+    tb.Radiobutton(frame_manual, text="Packs", variable=type_var, value="packs").grid(row=2, column=2, sticky="w")
+
+    tb.Label(frame_manual, text="Cantidad:").grid(row=3, column=0, sticky="e", padx=12, pady=8)
+    cant_var = tb.StringVar(value="")
+    tb.Entry(frame_manual, textvariable=cant_var, width=12).grid(row=3, column=1, sticky="w", padx=12)
+
+    status_var = tb.StringVar(value="🟢 Listo – escaneá QR o usa manual.")
+    tb.Label(root, textvariable=status_var, font=("Segoe UI", 12), wraplength=900, justify="left").pack(pady=12, padx=40)
+
+    def reset_form():
+        motivo_var.set("Venta")
+        obs_var.set("")
+        cant_var.set("")
+        qr_var.set("")
+        qr_entry.focus_set()
+
+    def on_product_select(event=None):
+        val = prod_var.get()
+        if not val:
+            lote_combo["values"] = []
+            lote_var.set("")
+            return
+        try:
+            pid = int(val.split(" - ")[0])
+            lotes = get_lotes_for_product(conn, pid)
+            lote_combo["values"] = lotes
+            lote_var.set(lotes[0] if lotes else "")
+        except Exception:
+            lote_combo["values"] = []
+            lote_var.set("")
+
+    prod_combo.bind("<<ComboboxSelected>>", on_product_select)
+
+    def on_qr_scan(event=None):
+        raw = qr_var.get().strip()
         if not raw:
             return
-        reset_input()
+        qr_var.set("")
 
         try:
-            data = parse_qr_payload(raw)
-            pid = int(data["id_producto"])
-            lote = str(data["lote"]).strip()
-            serie = int(data["nro_serie"])
+            motivo = motivo_var.get()
+            obs = obs_var.get().strip() or None
 
-            # 1) validar que existe en ingreso (stock_pp)
-            pp_row = find_stock_pp_row_for_serial(conn_pg, pid, lote, serie)
-            if not pp_row:
-                raise ValueError("Este QR NO está registrado en ingreso (stock_pp). No se puede dar de baja.")
-
-            stock_pp_id, serie_inicio, serie_fin, packs_fin = pp_row
-            packs_fin = int(packs_fin or 0)
-
-            # 2) validar que no esté ya dado de baja
-            if salida_already_done(conn_pg, pid, lote, serie):
-                raise ValueError("Este QR ya fue dado de baja anteriormente (salida duplicada).")
-
-            # 3) determinar unidad a descontar (pallet o packs)
-            if packs_fin > 0 and int(serie) == int(serie_fin):
-                unit_type = "packs"
-                packs_qty = packs_fin
-            else:
-                unit_type = "pallet"
-                packs_qty = 0
-
-            # 4) validar stock suficiente (neto)
-            net_p_before, net_pk_before, desc = compute_net_stock(conn_pg, pid, lote)
-
-            if unit_type == "pallet":
-                if net_p_before < 1:
-                    raise ValueError(f"No hay pallets disponibles para dar de baja. Stock pallets actual: {net_p_before}")
-            else:
-                if net_pk_before < packs_qty:
-                    raise ValueError(f"No hay packs suficientes para dar de baja. Stock packs actual: {net_pk_before} | Requiere: {packs_qty}")
-
-            # 5) insertar salida
-            mov_id, created_at = insert_salida(
-                conn_pg,
-                pid, lote, serie,
-                unit_type, packs_qty,
-                int(stock_pp_id),
-                raw_payload=raw
-            )
-
-            # 6) calcular stock neto después
-            net_p_after, net_pk_after, _ = compute_net_stock(conn_pg, pid, lote)
-
-            # 7) Enviar update a Sheets (con outbox)
-            try:
-                payload = build_payload_for_product_lote_net(conn_pg, pid, lote)
-                queue_outbox(conn_pg, payload)
-                sent = flush_outbox(conn_pg)
-                pending = outbox_count(conn_pg)
-                sheets_var.set(f"✅ Enviado(s): {sent} | Pendientes (outbox): {pending}")
-            except Exception as e:
-                pending = outbox_count(conn_pg)
-                sheets_var.set(f"⚠️ No se pudo enviar a Sheets: {e} | Pendientes (outbox): {pending}")
-
-            root.bell()
-
-            if unit_type == "pallet":
-                baja_txt = "1 pallet"
-            else:
-                baja_txt = f"{packs_qty} packs (parcial)"
+            baja_id, pid, desc, lote, ns, tipo_unidad, cantidad, net_p, net_pk, warn = baja_por_qr(conn, raw, motivo, obs)
 
             status_var.set(
-                f"✅ Baja registrada\n"
-                f"ID salida: {mov_id} | {created_at}\n"
-                f"Producto: {pid} | {desc}\n"
-                f"Lote: {lote} | Serie: {serie}\n"
-                f"Se descontó: {baja_txt}\n\n"
-                f"📦 Stock neto pallets: {net_p_after}\n"
-                f"📦 Stock neto packs: {net_pk_after}"
+                f"✅ Baja por QR registrada\n"
+                f"Identificador de baja: {baja_id}\n"
+                f"Producto: {pid} - {desc}\n"
+                f"Lote: {lote} | Número de serie (solo validación): {ns}\n"
+                f"Tipo de unidad: {tipo_unidad} | Cantidad: {cantidad}\n"
+                f"Motivo: {motivo}\n"
+                f"Observaciones: {obs if obs else 'Ninguna'}\n"
+                f"Neto TOTAL producto → Pallets: {net_p} | Packs: {net_pk}\n"
+                f"{warn}"
             )
+            reset_form()
 
         except Exception as e:
-            status_var.set(f"❌ ERROR: {e}")
-            root.bell()
+            status_var.set(f"❌ ERROR al registrar salida por QR: {e}")
+            qr_entry.focus_set()
 
-    def retry_flush():
+    qr_entry.bind("<Return>", on_qr_scan)
+
+    def on_manual_baja():
         try:
-            sent = flush_outbox(conn_pg)
-            pending = outbox_count(conn_pg)
-            sheets_var.set(f"✅ Enviado(s): {sent} | Pendientes (outbox): {pending}")
-            messagebox.showinfo("Outbox Sheets", f"Enviados: {sent}\nPendientes: {pending}")
+            pstr = prod_var.get()
+            if not pstr:
+                raise ValueError("Selecciona producto")
+            pid = int(pstr.split(" - ")[0])
+
+            lote = lote_var.get().strip()
+            if not lote:
+                raise ValueError("Selecciona lote")
+
+            tipo = type_var.get()
+            qty_str = cant_var.get().strip()
+            if not qty_str.isdigit():
+                raise ValueError("Cantidad debe ser número")
+            qty = int(qty_str)
+            if qty <= 0:
+                raise ValueError("Cantidad > 0")
+
+            motivo = motivo_var.get()
+            obs = obs_var.get().strip() or None
+
+            baja_id, pid, desc, lote, tipo_unidad, cantidad, net_p, net_pk, warn = baja_manual(conn, pid, lote, tipo, qty, motivo, obs)
+
+            status_var.set(
+                f"✅ Baja manual registrada\n"
+                f"Identificador de baja: {baja_id}\n"
+                f"Producto: {pid} - {desc}\n"
+                f"Lote: {lote}\n"
+                f"Tipo de unidad: {tipo_unidad} | Cantidad: {cantidad}\n"
+                f"Motivo: {motivo}\n"
+                f"Observaciones: {obs if obs else 'Ninguna'}\n"
+                f"Neto TOTAL producto → Pallets: {net_p} | Packs: {net_pk}\n"
+                f"{warn}"
+            )
+            reset_form()
+
         except Exception as e:
-            messagebox.showerror("Outbox Sheets", f"Error:\n{e}")
+            status_var.set(f"❌ ERROR al registrar salida manual: {e}")
 
-    btn_frame = tb.Frame(root)
-    btn_frame.pack(pady=10)
-    tb.Button(btn_frame, text="Reintentar envío a Sheets (outbox)", bootstyle=WARNING, command=retry_flush).pack(side="left", padx=6)
-    tb.Button(btn_frame, text="Limpiar", bootstyle=SECONDARY, command=lambda: status_var.set("🟢 Listo: escaneá un QR y Enter.")).pack(side="left", padx=6)
+    tb.Button(root, text="EJECUTAR BAJA MANUAL", bootstyle=WARNING, width=25, command=on_manual_baja).pack(pady=16)
 
-    entry_scan.bind("<Return>", on_scan_return)
+    if options:
+        prod_var.set(options[0])
+        on_product_select()
 
-    def on_close():
-        try:
-            conn_pg.close()
-        except Exception:
-            pass
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 

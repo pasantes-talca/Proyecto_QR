@@ -144,7 +144,6 @@ def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int):
     """
     _, api_key = get_sheet_settings()
 
-    # 1) Intento nuevo: scan_pp
     payload_new = {
         "api_key": api_key,
         "action": "scan_pp",
@@ -157,7 +156,6 @@ def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int):
     if isinstance(res, dict) and res.get("ok") is True:
         return res
 
-    # 2) Fallback viejo: update_row
     if isinstance(res, dict) and _looks_like_unknown_action(res):
         payload_old = {
             "api_key": api_key,
@@ -189,11 +187,9 @@ def send_bulk_to_sheet(rows, chunk_size: int = 500):
     total = len(rows)
     snapshot_id = str(uuid.uuid4())
 
-    # 1) Intento nuevo: bulk_snapshot_pp (con bloques)
     wrote_total = 0
     blocks = 0
 
-    # Si está vacío, igual mando un snapshot vacío para que LIMPIE el sheet
     if total == 0:
         payload = {
             "api_key": api_key,
@@ -216,7 +212,6 @@ def send_bulk_to_sheet(rows, chunk_size: int = 500):
                 "last_response": res0
             }
 
-        # fallback viejo si el nuevo no existe
         if isinstance(res0, dict) and _looks_like_unknown_action(res0):
             payload_old = {"api_key": api_key, "type": "bulk", "rows": []}
             res_old = _post_json_to_webapp(payload_old, timeout=30)
@@ -226,7 +221,6 @@ def send_bulk_to_sheet(rows, chunk_size: int = 500):
 
         return res0
 
-    # con datos => bloques
     for start in range(0, total, chunk_size):
         chunk = rows[start:start + chunk_size]
         block_index = start // chunk_size
@@ -245,7 +239,6 @@ def send_bulk_to_sheet(rows, chunk_size: int = 500):
 
         res = _post_json_to_webapp(payload, timeout=60)
         if not (isinstance(res, dict) and res.get("ok") is True):
-            # si el WebApp es viejo y no entiende bulk_snapshot_pp, hacemos fallback a bulk
             if isinstance(res, dict) and _looks_like_unknown_action(res):
                 payload_old = {"api_key": api_key, "type": "bulk", "rows": rows}
                 res_old = _post_json_to_webapp(payload_old, timeout=60)
@@ -319,6 +312,7 @@ def parse_qr_payload(raw: str) -> dict:
         return {
             "nro_serie": int(data["NS"]),
             "id_producto": int(normalize_id_value(data["PRD"])),
+            "descripcion_qr": str(data["DSC"]).strip(),
             "lote": str(data["LOT"]).strip(),
             "creacion": normalize_date_iso(data["FEC"]),
             "vencimiento": normalize_date_iso(data["VTO"]),
@@ -368,10 +362,40 @@ def get_product_desc(conn, id_producto: int) -> str:
         return str(row[0]).strip() if row else ""
 
 
+def qr_already_scanned(conn, id_producto: int, nro_serie: int, lote: str, descripcion_qr: str) -> bool:
+    """
+    Bloquea repetidos si ya existe en BD uno con:
+      - (id_producto + nro_serie + lote)  OR
+      - (descripcion + nro_serie + lote)
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+    tprod = cfg["table_products"]
+
+    desc = (descripcion_qr or "").strip()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT 1
+            FROM {schema}.{tstock} s
+            JOIN {schema}.{tprod} p ON p.id = s.id_producto
+            WHERE
+              (s.id_producto = %s AND s.nro_serie = %s AND s.lote = %s)
+              OR
+              (LOWER(TRIM(p.descripcion)) = LOWER(TRIM(%s)) AND s.nro_serie = %s AND s.lote = %s)
+            LIMIT 1;
+            """,
+            (int(id_producto), int(nro_serie), str(lote), desc, int(nro_serie), str(lote)),
+        )
+        return cur.fetchone() is not None
+
+
 def insert_one(conn, id_producto: int, nro_serie: int, lote: str, creacion_iso, venc_iso,
                tipo_unidad: str, packs: int):
     """
-    Inserta 1 fila. Si ya existe, no rompe (DO NOTHING).
+    Inserta 1 fila. Si ya existe (por UNIQUE), no rompe (DO NOTHING).
     Devuelve True si insertó, False si ya existía.
     """
     cfg = get_pg_config()
@@ -434,7 +458,6 @@ def compute_net_stock(conn, id_producto: int):
       salidas pallets  = SUM(productos_bajas.cantidad)
     Packs netos:
       ingresos packs = SUM(stock.packs WHERE tipo_unidad='PACKS')
-      (por ahora no restamos packs porque productos_bajas no distingue packs)
     """
     cfg = get_pg_config()
     schema = cfg["schema"]
@@ -483,10 +506,6 @@ def upsert_sheet(conn, id_producto: int, stock_pallets: int, stock_packs: int):
 
 
 def fetch_all_sheet_rows(conn):
-    """
-    Trae todas las filas para exportar al Google Sheet:
-    descripcion, stock_pallets, stock_packs
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tsheet = cfg["table_sheet"]
@@ -518,22 +537,11 @@ def main():
     conn = pg_connect()
 
     root = tb.Window(themename="minty")
-    root.title("Escáner QRs – Flujo libre (autocompleta medios) + Sheet Sync")
+    root.title("Escáner QRs")
     root.geometry("980x620")
 
-    tb.Label(root, text="Escaneo de ENTRADA (flujo libre)", font=("Segoe UI", 20, "bold")).pack(pady=14)
-    tb.Label(
-        root,
-        text="Escaneá QRs en cualquier orden.\n"
-             "Guarda cada escaneo y, si detecta continuidad para ese producto+lote, completa los del medio.\n"
-             "Además actualiza el Google Sheet.",
-        font=("Segoe UI", 10),
-        justify="center"
-    ).pack(pady=4)
-
-    # Botón SYNC TODO
-    btn_frame = tb.Frame(root)
-    btn_frame.pack(pady=6)
+    tb.Label(root, text="Escaneo de ENTRADA", font=("Segoe UI", 20, "bold")).pack(pady=14)
+    tb.Label(root, font=("Segoe UI", 10), justify="center").pack(pady=4)
 
     def on_sync_all():
         try:
@@ -557,8 +565,6 @@ def main():
         except Exception as e:
             messagebox.showerror("Sync Google Sheet", f"❌ Error:\n{e}")
 
-    tb.Button(btn_frame, text="SYNC TODO AL SHEET", bootstyle=SUCCESS, command=on_sync_all).pack()
-
     # Input QR
     scan_var = tb.StringVar()
     entry_scan = tb.Entry(root, textvariable=scan_var, width=98, font=("Segoe UI", 14))
@@ -569,7 +575,7 @@ def main():
     is_partial_var = tb.BooleanVar(value=False)
     toggle = tb.Checkbutton(
         root,
-        text="Este pallet es PARCIAL (cargar packs)",
+        text="Pallet PARCIAL (cargar packs)",
         variable=is_partial_var,
         bootstyle="warning-round-toggle"
     )
@@ -578,13 +584,29 @@ def main():
     # Packs input
     packs_frame = tb.Frame(root)
     packs_frame.pack(pady=6)
-    tb.Label(packs_frame, text="Packs (solo si parcial):", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+    tb.Label(
+        packs_frame,
+        text="Cantidad de packs (Indicar solo si no es pallet completo):",
+        font=("Segoe UI", 11)
+    ).pack(side="left", padx=(0, 8))
+
     packs_var = tb.StringVar(value="")
     entry_packs = tb.Entry(packs_frame, textvariable=packs_var, width=10, font=("Segoe UI", 12))
     entry_packs.pack(side="left")
 
     status_var = tb.StringVar(value="🟢 Listo: escaneá un QR y Enter.")
-    tb.Label(root, textvariable=status_var, font=("Segoe UI", 11), justify="left").pack(pady=14)
+    tb.Label(
+        root,
+        textvariable=status_var,
+        font=("Segoe UI", 11),
+        justify="left",
+        wraplength=940
+    ).pack(pady=14)
+
+    # ---- BOTÓN ABAJO DE TODO ----
+    footer = tb.Frame(root)
+    footer.pack(side=BOTTOM, fill=X, pady=(0, 14))
+    tb.Button(footer, text="ENVIAR AL SHEET", bootstyle=SUCCESS, command=on_sync_all).pack()
 
     # cache en memoria: último nro_serie por (id_producto, lote)
     last_seen = {}  # key=(pid,lote) -> last_serie
@@ -606,18 +628,40 @@ def main():
         pending["data"] = None
         entry_scan.focus_set()
 
+    def format_qr_detail(pid, serie, dsc_qr, lote, cre, vto):
+        return (
+            f"Número de Serie: {serie}\n"
+            f"ID Producto: {pid}\n"
+            f"Descripción: {dsc_qr}\n"
+            f"Lote: {lote}\n"
+            f"Fecha de creación: {cre}\n"
+            f"Fecha de vencimiento: {vto}"
+        )
+
     def commit_scan(data: dict, unit_type: str, packs: int):
         pid = int(data["id_producto"])
         lote = str(data["lote"]).strip()
         serie = int(data["nro_serie"])
         cre = data["creacion"]
         vto = data["vencimiento"]
+        dsc_qr = str(data.get("descripcion_qr") or "").strip()
 
         if not product_exists(conn, pid):
             raise ValueError(f"El producto {pid} no existe en produccion.productos.")
 
+        # 🔒 BLOQUEO DE REPETIDOS (antes de insertar)
+        if qr_already_scanned(conn, pid, serie, lote, dsc_qr):
+            root.bell()
+            status_var.set(
+                "ERROR\n"
+                "Motivo: Este QR ya fue registrado.\n\n" +
+                format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
+            )
+            reset_after_commit()
+            return
+
         # 1) Inserto el QR escaneado
-        inserted_main = insert_one(
+        inserted = insert_one(
             conn,
             id_producto=pid,
             nro_serie=serie,
@@ -628,15 +672,22 @@ def main():
             packs=packs
         )
 
+        # Si por UNIQUE igual no insertó, lo tratamos como repetido
+        if not inserted:
+            root.bell()
+            status_var.set(
+                "ERROR\n"
+                "Motivo: Este QR ya fue registrado.\n\n" +
+                format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
+            )
+            reset_after_commit()
+            return
+
         # 2) Completo los del medio si hay continuidad
         key = (pid, lote)
-        inserted_mid = 0
-        skipped_mid = 0
         if key in last_seen:
             prev = int(last_seen[key])
-            ins, sk = insert_missing_between(conn, pid, lote, prev, serie, cre, vto)
-            inserted_mid += ins
-            skipped_mid += sk
+            insert_missing_between(conn, pid, lote, prev, serie, cre, vto)
 
         # 3) Actualizo último visto
         last_seen[key] = serie
@@ -645,29 +696,28 @@ def main():
         net_pallets, net_packs = compute_net_stock(conn, pid)
         upsert_sheet(conn, pid, net_pallets, net_packs)
 
-        desc = get_product_desc(conn, pid)
+        # 5) Envío al Google Sheet (1 fila) -> RESUMEN: ENVIADO / ERROR + INFO QR
+        desc_db = get_product_desc(conn, pid)
         root.bell()
 
-        # 5) Envío al Google Sheet (1 fila)
-        sheet_warn = ""
+        enviado_ok = False
+        detalle_error = ""
+
         try:
-            res = send_update_row_to_sheet(desc, net_pallets, net_packs)
-            if not (isinstance(res, dict) and res.get("ok") is True):
-                sheet_warn = f"\n⚠️ No se pudo actualizar Google Sheet: {res}"
+            res = send_update_row_to_sheet(desc_db, net_pallets, net_packs)
+            enviado_ok = isinstance(res, dict) and res.get("ok") is True
+            if not enviado_ok:
+                detalle_error = str(res)
         except Exception as e:
-            sheet_warn = f"\n⚠️ No se pudo actualizar Google Sheet: {e}"
+            enviado_ok = False
+            detalle_error = str(e)
 
-        tipo_txt = "✅ COMPLETO (+1 pallet)" if unit_type == "PALLET" else f"🟠 PARCIAL (+{packs} packs)"
-        status_var.set(
-            f"{tipo_txt}\n"
-            f"Producto: {pid} | {desc}\n"
-            f"Lote: {lote} | Serie: {serie}\n"
-            f"Insertó QR: {'sí' if inserted_main else 'ya existía'}\n"
-            f"Autocompletó medios → insertados: {inserted_mid} | ya existían: {skipped_mid}\n\n"
-            f"📦 Sheet → Pallets: {net_pallets} | Packs: {net_packs}"
-            f"{sheet_warn}"
-        )
+        line1 = "ENVIADO" if enviado_ok else "ERROR"
+        msg = f"{line1}\n\n" + format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
+        if not enviado_ok and detalle_error:
+            msg = f"{msg}\n\nDetalle: {detalle_error}"
 
+        status_var.set(msg)
         reset_after_commit()
 
     def on_scan_enter(event=None):
@@ -680,15 +730,24 @@ def main():
         try:
             data = parse_qr_payload(raw)
 
+            # NORMAL
             if not is_partial_var.get():
                 commit_scan(data, unit_type="PALLET", packs=0)
                 return
 
-            # parcial: pedir packs
+            # PARCIAL: pedir packs, pero mostrar detalle igual que cuando se envía
             pending["data"] = data
+
+            pid = int(data["id_producto"])
+            lote = str(data["lote"]).strip()
+            serie = int(data["nro_serie"])
+            cre = data["creacion"]
+            vto = data["vencimiento"]
+            dsc_qr = str(data.get("descripcion_qr") or "").strip()
+
             status_var.set(
-                f"🟠 QR leído (PARCIAL). Cargá packs y Enter.\n"
-                f"Producto {data['id_producto']} | Lote {data['lote']} | Serie {data['nro_serie']}"
+                "QR leído (PARCIAL). Cargá packs y Enter.\n\n" +
+                format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
             )
             entry_packs.focus_set()
 
