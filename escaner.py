@@ -46,7 +46,7 @@ DEFAULT_PG = {
     "schema": "produccion",
     "table_products": "productos",
     "table_stock": "stock",
-    "table_bajas": "productos_bajas",
+    "table_bajas": "bajas",
     "table_sheet": "sheet",
 }
 
@@ -455,7 +455,7 @@ def compute_net_stock(conn, id_producto: int):
     """
     Pallets netos:
       ingresos pallets = COUNT(stock WHERE tipo_unidad='PALLET')
-      salidas pallets  = SUM(productos_bajas.cantidad)
+      salidas pallets  = SUM(bajas.cantidad)
     Packs netos:
       ingresos packs = SUM(stock.packs WHERE tipo_unidad='PACKS')
     """

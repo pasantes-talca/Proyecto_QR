@@ -37,7 +37,7 @@ DEFAULT_PG = {
     "schema": "produccion",
     "table_products": "productos",
     "table_stock": "stock",
-    "table_bajas": "productos_bajas",
+    "table_bajas": "bajas",
     "table_sheet": "sheet",
 }
 
@@ -104,7 +104,7 @@ def pg_connect():
 
 def init_tables(conn):
     """
-    Asegura columnas necesarias en productos_bajas:
+    Asegura columnas necesarias en bajas:
       motivo, observaciones, tipo_unidad
     (NO crea nro_serie porque vos lo eliminaste.)
     """
@@ -412,7 +412,7 @@ def upsert_sheet(conn, id_producto: int, stock_pallets: int, stock_packs: int):
 def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str,
                    observaciones: str = None, tipo_unidad: str = None):
     """
-    Inserta SOLO en productos_bajas (sin nro_serie).
+    Inserta SOLO en bajas (sin nro_serie).
     """
     cfg = get_pg_config()
     schema = cfg["schema"]
@@ -475,7 +475,7 @@ def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
          - PALLET => cantidad = 1
          - PACKS  => cantidad = packs de esa fila
     3) Valida contra neto del lote.
-    4) Inserta en productos_bajas.
+    4) Inserta en bajas.
     5) Refresca sheet (Postgres + Google Sheet).
     """
     qr = parse_qr_payload(raw_payload)
@@ -511,7 +511,7 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int, mot
     Manual:
       - tipo pallet/packs
       - valida contra neto del lote
-      - inserta en productos_bajas
+      - inserta en bajas
       - refresca sheet
     """
     pid = int(id_producto)

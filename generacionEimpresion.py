@@ -144,10 +144,15 @@ def fetch_products(conn):
         return cur.fetchall()  # [(id, descripcion), ...]
 
 
-def get_db_max_serie_for_lote(conn, id_producto: int, lote: str) -> int:
+def get_db_max_serie_for_producto(conn, id_producto: int) -> int:
     """
-    Busca el máximo nro_serie ya ingresado en produccion.stock para ese producto+lote.
-    Si todavía no hay ingresos, devuelve 0.
+    ✅ NUEVO:
+    Busca el máximo nro_serie ya ingresado en produccion.stock para ESE PRODUCTO,
+    sin importar el lote.
+
+    Esto hace que si se generaron QR de más (sobrantes) en un lote anterior y
+    NO se escanearon, la próxima producción (nuevo lote) continúe desde el último
+    nro_serie REALMENTE INGRESADO en stock.
     """
     cfg = get_pg_config()
     schema = cfg["schema"]
@@ -157,22 +162,27 @@ def get_db_max_serie_for_lote(conn, id_producto: int, lote: str) -> int:
         cur.execute(f"""
             SELECT COALESCE(MAX(nro_serie), 0)
             FROM {schema}.{tstock}
-            WHERE id_producto = %s AND lote = %s;
-        """, (int(id_producto), str(lote)))
+            WHERE id_producto = %s;
+        """, (int(id_producto),))
         return int(cur.fetchone()[0] or 0)
 
 
 def get_starting_serie(conn, id_producto: int, lote: str) -> int:
     """
-    Evita duplicados:
-    - max en DB (lo ya escaneado/ingresado)
-    - max en cache local (lo ya generado en esta PC aunque todavía no escaneado)
+    ✅ AJUSTE NUEVO (lo que me pediste):
+
+    - Base REAL: max(nro_serie) en DB para ese PRODUCTO (cualquier lote)
+    - Plus seguridad local: cache de "último generado" SOLO para (producto + lote actual)
+      para evitar duplicar números si en el mismo día/lote se aprieta "Generar" más de una vez
+      antes de escanear.
 
     Arranca desde el mayor de ambos.
     """
-    db_max = get_db_max_serie_for_lote(conn, id_producto, lote)
+    db_max = get_db_max_serie_for_producto(conn, id_producto)
+
     cache_key = f"gen_ultimo_serie::{id_producto}::{lote}"
     cache_max = int(cache_get(cache_key, 0) or 0)
+
     return max(db_max, cache_max)
 
 
@@ -200,7 +210,7 @@ def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: i
     fecha_str = fecha_actual.strftime("%d/%m/%y")
     fecha_venc_str = (fecha_actual + relativedelta(months=6)).strftime("%d/%m/%y")
 
-    # Serie inicial (DB vs cache)
+    # ✅ Serie inicial (DB por PRODUCTO vs cache por LOTE actual)
     nro_serie = get_starting_serie(conn, id_producto, numero_lote)
 
     pdf_path = filedialog.asksaveasfilename(
@@ -288,10 +298,13 @@ def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: i
 
     c.save()
 
-    # guardamos en cache el último generado (por producto + lote)
+    # guardamos en cache el último generado (por producto + lote actual)
     set_last_generated(id_producto, numero_lote, nro_serie)
 
-    messagebox.showinfo("PDF generado", f"✅ PDF guardado:\n{pdf_path}\n\nLote: {numero_lote}")
+    messagebox.showinfo(
+        "PDF generado",
+        f"✅ PDF guardado:\n{pdf_path}\n\nLote: {numero_lote}\nÚltimo número de serie generado: {nro_serie}"
+    )
 
 
 # =======================
