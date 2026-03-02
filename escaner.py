@@ -37,12 +37,12 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 
 DEFAULT_PG = {
-    "host": os.getenv("TALCA_PG_HOST", "localhost"),
-    "port": int(os.getenv("TALCA_PG_PORT", "5432")),
-    "dbname": os.getenv("TALCA_PG_DB", "postgres"),
-    "user": os.getenv("TALCA_PG_USER", "postgres"),
-    "password": os.getenv("TALCA_PG_PASS", ""),
-    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),
+    "host": "10.242.4.13",
+    "port": 5432,
+    "dbname": "stock",
+    "user": "postgres",
+    "password": "Talca2025",
+    "client_encoding": "WIN1252",
     "schema": "produccion",
     "table_products": "productos",
     "table_stock": "stock",
