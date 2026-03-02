@@ -44,8 +44,6 @@ DEFAULT_PG = {
 # =======================
 #   GOOGLE SHEET WEBAPP
 # =======================
-# Si querés moverlo a config.json:
-# "sheet": {"webapp_url":"...", "api_key":"..."}
 SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwwzMiTB7DEbcOdvi5Vl32xF-McguAlgkzcBQoeAGhzlowc5J1PjF1QLChNcukf5fbn/exec"
 SHEETS_API_KEY = "TALCA-QR-2026"
 
@@ -106,7 +104,6 @@ def init_tables(conn):
     """
     Asegura columnas necesarias en bajas:
       motivo, observaciones, tipo_unidad
-    (NO crea nro_serie porque vos lo eliminaste.)
     """
     cfg = get_pg_config()
     schema = cfg["schema"]
@@ -168,10 +165,6 @@ def init_tables(conn):
 #   QR PARSER
 # =======================
 def parse_qr_payload(raw: str) -> dict:
-    """
-    Formato esperado:
-      NS=000001|PRD=4910|DSC=...|LOT=240226|FEC=...|VTO=...
-    """
     raw = raw.strip()
     if "|" in raw and "=" in raw:
         parts = raw.split("|")
@@ -182,7 +175,7 @@ def parse_qr_payload(raw: str) -> dict:
                 data[k.strip().upper()] = v.strip()
 
         if not data.get("NS") or not data.get("PRD") or not data.get("LOT"):
-            raise ValueError("QR inválido: faltan campos (Número de serie / Identificador de producto / Lote).")
+            raise ValueError("QR inválido: faltan campos (Número de serie / ID producto / Lote).")
 
         return {
             "nro_serie": int(data["NS"]),
@@ -278,10 +271,6 @@ def get_lotes_for_product(conn, id_producto: int):
 
 
 def qr_exists_in_stock(conn, id_producto: int, lote: str, nro_serie: int):
-    """
-    Verifica que el QR exista en stock (modelo por fila/serie).
-    Devuelve (tipo_unidad, packs) o None.
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -300,18 +289,12 @@ def qr_exists_in_stock(conn, id_producto: int, lote: str, nro_serie: int):
 
 
 def compute_net_available_lote(conn, id_producto: int, lote: str):
-    """
-    Neto disponible por LOTE:
-      pallets_net = count(PALLET en stock lote) - sum(bajas PALLET lote)
-      packs_net   = sum(packs en stock lote)  - sum(bajas PACKS lote)
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
     tbajas = cfg["table_bajas"]
 
     with conn.cursor() as cur:
-        # Entradas
         cur.execute(f"""
             SELECT COALESCE(COUNT(*),0)
             FROM {schema}.{tstock}
@@ -326,7 +309,6 @@ def compute_net_available_lote(conn, id_producto: int, lote: str):
         """, (int(id_producto), str(lote)))
         in_packs = int(cur.fetchone()[0] or 0)
 
-        # Bajas
         cur.execute(f"""
             SELECT COALESCE(SUM(cantidad),0)
             FROM {schema}.{tbajas}
@@ -347,11 +329,6 @@ def compute_net_available_lote(conn, id_producto: int, lote: str):
 
 
 def compute_net_totals_product(conn, id_producto: int):
-    """
-    Neto por PRODUCTO (todos los lotes):
-      net_pallets = count(PALLET stock) - sum(bajas PALLET)
-      net_packs   = sum(packs stock)    - sum(bajas PACKS)
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -411,9 +388,6 @@ def upsert_sheet(conn, id_producto: int, stock_pallets: int, stock_packs: int):
 
 def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str,
                    observaciones: str = None, tipo_unidad: str = None):
-    """
-    Inserta SOLO en bajas (sin nro_serie).
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tbajas = cfg["table_bajas"]
@@ -444,11 +418,6 @@ def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str
 
 
 def refresh_sheet_everywhere(conn, id_producto: int):
-    """
-    Recalcula NETO por producto, actualiza:
-      - Postgres: produccion.sheet
-      - Google Sheet: scan_pp (una fila por descripcion)
-    """
     desc = get_product_desc(conn, id_producto)
     net_pallets, net_packs = compute_net_totals_product(conn, id_producto)
 
@@ -466,22 +435,13 @@ def refresh_sheet_everywhere(conn, id_producto: int):
 
 
 # =======================
-#   BAJAS (QR / MANUAL)
+#   BAJAS
 # =======================
 def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
-    """
-    1) Verifica que el QR exista en stock.
-    2) Determina tipo_unidad y cantidad:
-         - PALLET => cantidad = 1
-         - PACKS  => cantidad = packs de esa fila
-    3) Valida contra neto del lote.
-    4) Inserta en bajas.
-    5) Refresca sheet (Postgres + Google Sheet).
-    """
     qr = parse_qr_payload(raw_payload)
     pid = int(qr["id_producto"])
     lote = str(qr["lote"])
-    ns = int(qr["nro_serie"])  # NO se guarda en bajas, se usa solo para validar existencia en stock.
+    ns = int(qr["nro_serie"])  # solo validación
 
     stock_info = qr_exists_in_stock(conn, pid, lote, ns)
     if not stock_info:
@@ -507,13 +467,6 @@ def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
 
 
 def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int, motivo: str, observaciones: str = None):
-    """
-    Manual:
-      - tipo pallet/packs
-      - valida contra neto del lote
-      - inserta en bajas
-      - refresca sheet
-    """
     pid = int(id_producto)
     lote = str(lote).strip()
     tipo = (tipo or "").strip().lower()
@@ -539,7 +492,7 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int, mot
 
 
 # =======================
-#   UI
+#   UI (CENTRADO)
 # =======================
 def main():
     try:
@@ -553,44 +506,52 @@ def main():
     root.title("Baja por QR / Manual – Talca")
     root.geometry("1100x800")
 
-    tb.Label(root, text="Baja por QR o Manual", font=("Segoe UI", 22, "bold")).pack(pady=16)
+    # CONTENEDOR CENTRAL (centra todo)
+    container = tb.Frame(root)
+    container.pack(expand=True)
 
-    # Motivo
+    tb.Label(container, text="Baja por QR o Manual", font=("Segoe UI", 22, "bold")).pack(pady=16)
+
+    # Motivo (uno solo)
     motivo_var = tb.StringVar(value="Venta")
-    frame_motivo = tb.Frame(root)
+    frame_motivo = tb.Frame(container)
     frame_motivo.pack(pady=8)
     tb.Label(frame_motivo, text="Motivo de baja:").pack(side="left", padx=10)
     tb.Radiobutton(frame_motivo, text="Venta", variable=motivo_var, value="Venta").pack(side="left", padx=10)
     tb.Radiobutton(frame_motivo, text="Calidad", variable=motivo_var, value="Calidad").pack(side="left", padx=10)
     tb.Radiobutton(frame_motivo, text="Desarme", variable=motivo_var, value="Desarme").pack(side="left", padx=10)
 
-    # Observaciones
-    tb.Label(root, text="Observaciones (opcional):", font=("Segoe UI", 12)).pack(pady=4)
-    obs_var = tb.StringVar()
-    tb.Entry(root, textvariable=obs_var, width=90, font=("Segoe UI", 12)).pack(pady=4)
+    # Carga por QR
+    tb.Label(container, text="Carga por QR: Escaneá con pistola lectora", font=("Segoe UI", 14)).pack(pady=(16, 8))
 
-    # Modo QR
-    tb.Label(root, text="Modo QR: Escanea con pistola lectora", font=("Segoe UI", 14)).pack(pady=12)
     qr_var = tb.StringVar()
-    qr_entry = tb.Entry(root, textvariable=qr_var, width=80, font=("Segoe UI", 14))
-    qr_entry.pack(pady=8)
+    qr_entry = tb.Entry(container, textvariable=qr_var, width=80, font=("Segoe UI", 14))
+    qr_entry.pack(pady=(0, 8))
     qr_entry.focus_set()
 
-    # Manual
-    tb.Label(root, text="Modo Manual", font=("Segoe UI", 14)).pack(pady=16)
-    frame_manual = tb.Frame(root)
-    frame_manual.pack(pady=8, padx=40, fill="x")
+    tb.Label(container, text="Observaciones para baja por QR (opcional):", font=("Segoe UI", 12)).pack(pady=4)
+    obs_qr_var = tb.StringVar()
+    obs_qr_entry = tb.Entry(container, textvariable=obs_qr_var, width=90, font=("Segoe UI", 12))
+    obs_qr_entry.pack(pady=(0, 12))
+
+    qr_pending = {"raw": None}
+
+    # Carga Manual
+    tb.Label(container, text="Carga Manual", font=("Segoe UI", 14)).pack(pady=(8, 10))
+
+    frame_manual = tb.Frame(container)  # <- NO fill="x" (así queda centrado)
+    frame_manual.pack(pady=8)
 
     tb.Label(frame_manual, text="Producto:").grid(row=0, column=0, sticky="e", padx=12, pady=8)
     prods = get_products_with_stock(conn)
     options = [f"{pid} - {desc}" for pid, desc in prods]
     prod_var = tb.StringVar()
-    prod_combo = tb.Combobox(frame_manual, textvariable=prod_var, values=options, width=60)
+    prod_combo = tb.Combobox(frame_manual, textvariable=prod_var, values=options, width=60, state="readonly")
     prod_combo.grid(row=0, column=1, columnspan=3, sticky="w", padx=12, pady=8)
 
     tb.Label(frame_manual, text="Lote:").grid(row=1, column=0, sticky="e", padx=12, pady=8)
     lote_var = tb.StringVar()
-    lote_combo = tb.Combobox(frame_manual, textvariable=lote_var, width=30)
+    lote_combo = tb.Combobox(frame_manual, textvariable=lote_var, width=30, state="readonly")
     lote_combo.grid(row=1, column=1, sticky="w", padx=12, pady=8)
 
     tb.Label(frame_manual, text="Tipo:").grid(row=2, column=0, sticky="e", padx=12, pady=8)
@@ -602,15 +563,40 @@ def main():
     cant_var = tb.StringVar(value="")
     tb.Entry(frame_manual, textvariable=cant_var, width=12).grid(row=3, column=1, sticky="w", padx=12)
 
-    status_var = tb.StringVar(value="🟢 Listo – escaneá QR o usa manual.")
-    tb.Label(root, textvariable=status_var, font=("Segoe UI", 12), wraplength=900, justify="left").pack(pady=12, padx=40)
+    tb.Label(container, text="Observaciones para baja manual (opcional):", font=("Segoe UI", 12)).pack(pady=4)
+    obs_manual_var = tb.StringVar()
+    obs_manual_entry = tb.Entry(container, textvariable=obs_manual_var, width=90, font=("Segoe UI", 12))
+    obs_manual_entry.pack(pady=(0, 16))
 
-    def reset_form():
-        motivo_var.set("Venta")
-        obs_var.set("")
-        cant_var.set("")
+    # Botón enviar
+    status_var = tb.StringVar(value="🟢 Listo – escaneá un QR o completá la carga manual.")
+    btn_send = tb.Button(container, text="ENVIAR", bootstyle=WARNING, width=25)
+    btn_send.pack(pady=(6, 12))
+
+    status_label = tb.Label(container, textvariable=status_var, font=("Segoe UI", 12), wraplength=900, justify="center")
+    status_label.pack(pady=(0, 10), padx=40)
+
+    def update_wrap(event=None):
+        try:
+            w = root.winfo_width()
+            status_label.configure(wraplength=max(500, w - 200))
+        except Exception:
+            pass
+
+    root.bind("<Configure>", update_wrap)
+
+    # Helpers
+    def clear_qr_inputs():
+        qr_pending["raw"] = None
         qr_var.set("")
-        qr_entry.focus_set()
+        obs_qr_var.set("")
+
+    def clear_manual_inputs(keep_product=True):
+        if not keep_product:
+            prod_var.set("")
+            lote_var.set("")
+        cant_var.set("")
+        obs_manual_var.set("")
 
     def on_product_select(event=None):
         val = prod_var.get()
@@ -629,15 +615,23 @@ def main():
 
     prod_combo.bind("<<ComboboxSelected>>", on_product_select)
 
-    def on_qr_scan(event=None):
-        raw = qr_var.get().strip()
+    # Envíos
+    def submit_qr():
+        raw = qr_pending["raw"]
         if not raw:
-            return
-        qr_var.set("")
+            raw_field = qr_var.get().strip()
+            if raw_field:
+                raw = raw_field
+                qr_pending["raw"] = raw
+                qr_var.set("")
+            else:
+                status_var.set("❌ ERROR: No hay un QR pendiente para enviar.")
+                qr_entry.focus_set()
+                return
 
         try:
             motivo = motivo_var.get()
-            obs = obs_var.get().strip() or None
+            obs = obs_qr_var.get().strip() or None
 
             baja_id, pid, desc, lote, ns, tipo_unidad, cantidad, net_p, net_pk, warn = baja_por_qr(conn, raw, motivo, obs)
 
@@ -652,15 +646,15 @@ def main():
                 f"Neto TOTAL producto → Pallets: {net_p} | Packs: {net_pk}\n"
                 f"{warn}"
             )
-            reset_form()
+
+            clear_qr_inputs()
+            qr_entry.focus_set()
 
         except Exception as e:
             status_var.set(f"❌ ERROR al registrar salida por QR: {e}")
             qr_entry.focus_set()
 
-    qr_entry.bind("<Return>", on_qr_scan)
-
-    def on_manual_baja():
+    def submit_manual():
         try:
             pstr = prod_var.get()
             if not pstr:
@@ -680,7 +674,7 @@ def main():
                 raise ValueError("Cantidad > 0")
 
             motivo = motivo_var.get()
-            obs = obs_var.get().strip() or None
+            obs = obs_manual_var.get().strip() or None
 
             baja_id, pid, desc, lote, tipo_unidad, cantidad, net_p, net_pk, warn = baja_manual(conn, pid, lote, tipo, qty, motivo, obs)
 
@@ -695,13 +689,45 @@ def main():
                 f"Neto TOTAL producto → Pallets: {net_p} | Packs: {net_pk}\n"
                 f"{warn}"
             )
-            reset_form()
+
+            clear_manual_inputs(keep_product=True)
+            qr_entry.focus_set()
 
         except Exception as e:
             status_var.set(f"❌ ERROR al registrar salida manual: {e}")
 
-    tb.Button(root, text="EJECUTAR BAJA MANUAL", bootstyle=WARNING, width=25, command=on_manual_baja).pack(pady=16)
+    def on_send_click():
+        if qr_pending["raw"] or qr_var.get().strip():
+            submit_qr()
+        else:
+            submit_manual()
 
+    btn_send.configure(command=on_send_click)
+
+    # Flujo QR -> Obs -> Enter
+    def on_qr_scan(event=None):
+        raw = qr_var.get().strip()
+        if not raw:
+            return
+
+        try:
+            parse_qr_payload(raw)
+        except Exception as e:
+            status_var.set(f"❌ ERROR: QR inválido: {e}")
+            qr_var.set("")
+            qr_entry.focus_set()
+            return
+
+        qr_pending["raw"] = raw
+        qr_var.set("")
+        status_var.set("🟡 QR leído. Ingresá observaciones (opcional) y presioná Enter, o tocá ENVIAR.")
+        obs_qr_entry.focus_set()
+
+    qr_entry.bind("<Return>", on_qr_scan)
+    obs_qr_entry.bind("<Return>", lambda e: submit_qr())
+    obs_manual_entry.bind("<Return>", lambda e: submit_manual())
+
+    # init combos
     if options:
         prod_var.set(options[0])
         on_product_select()
