@@ -1,4 +1,4 @@
-import os, sys, json, logging
+import os, sys, json, logging, urllib.request, urllib.error
 from datetime import date, timedelta
 
 import ttkbootstrap as tb
@@ -24,6 +24,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
+# ↓↓↓ REEMPLAZA CON TU URL REAL DE APPS SCRIPT ↓↓↓
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwwzMiTB7DEbcOdvi5Vl32xF-McguAlgkzcBQoeAGhzlowc5J1PjF1QLChNcukf5fbn/exec"
+
 def get_app_dir():
     return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 
@@ -42,9 +45,7 @@ DEFAULT_PG = {
     "table_stock": "stock",
     "table_bajas": "bajas",
     "table_sheet": "sheet",
-    "dias_vencimiento": int(os.getenv("TALCA_DIAS_VENC", "180")),
 }
-
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         return {}
@@ -153,7 +154,7 @@ def _neto_stock(conn, pid, schema, tstock):
             cur.execute(f"""
                 SELECT
                     COUNT(*) FILTER (WHERE tipo_unidad='PALLET') AS pallets,
-                    COUNT(*) FILTER (WHERE tipo_unidad='PACKS')  AS packs
+                    COALESCE(SUM(packs), 0)                      AS packs
                 FROM {schema}.{tstock} WHERE id_producto=%s;
             """, (pid,))
             row = cur.fetchone()
@@ -161,12 +162,9 @@ def _neto_stock(conn, pid, schema, tstock):
     except Exception as exc:
         log.warning("No se pudo calcular neto: %s", exc)
         return 0, 0, "No se pudo calcular el neto actual."
-
 def _descontar_bajas(cur, schema, tbajas, id_producto, lote, tipo_unidad, cantidad_a_descontar):
     """
-    Descuenta de la tabla bajas (motivo='Venta') de forma FIFO:
-    - Si la fila tiene <= cantidad a descontar: la ELIMINA.
-    - Si tiene mas: REDUCE su cantidad.
+    Descuenta de la tabla bajas (motivo='Venta') de forma FIFO.
     Usa FOR UPDATE para evitar race conditions.
     """
     tipo_unidad = tipo_unidad.upper()
@@ -191,12 +189,10 @@ def _descontar_bajas(cur, schema, tbajas, id_producto, lote, tipo_unidad, cantid
         if restante <= 0:
             break
         if fila_cant <= restante:
-            # Eliminar fila completa
             cur.execute(f"DELETE FROM {schema}.{tbajas} WHERE id=%s;", (fila_id,))
             log.info("Baja eliminada: id=%s cantidad=%s", fila_id, fila_cant)
             restante -= fila_cant
         else:
-            # Reducir cantidad parcialmente
             nueva_cant = fila_cant - restante
             cur.execute(f"UPDATE {schema}.{tbajas} SET cantidad=%s WHERE id=%s;", (nueva_cant, fila_id))
             log.info("Baja reducida: id=%s de %s a %s", fila_id, fila_cant, nueva_cant)
@@ -205,12 +201,93 @@ def _descontar_bajas(cur, schema, tbajas, id_producto, lote, tipo_unidad, cantid
     if restante > 0:
         raise ValueError(f"No hay suficiente cantidad en bajas. Faltaron {restante} unidades.")
 
+# ── GOOGLE SHEETS SYNC ────────────────────────────────────────────────────────
+def get_full_stock_for_sheet(conn):
+    cfg = get_pg_config()
+    schema, tprod, tstock, _ = _t(cfg)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                p.descripcion,
+                COUNT(s.id)  FILTER (WHERE s.tipo_unidad='PALLET') AS stock_pallets,
+                COALESCE(SUM(s.packs), 0)                          AS stock_packs
+            FROM {schema}.{tprod} p
+            LEFT JOIN {schema}.{tstock} s ON s.id_producto = p.id
+            GROUP BY p.id, p.descripcion
+            ORDER BY p.descripcion ASC;
+        """)
+        return cur.fetchall()
+def sync_sheet_after_reingreso(conn):
+    """
+    Envia un snapshot completo del stock actual al Google Apps Script (scan_pp por producto).
+    Se llama despues de cada reingreso exitoso. Los errores NO abortan el flujo principal.
+    """
+    url = APPS_SCRIPT_URL
+    if not url or "TU_ID_AQUI" in url:
+        log.warning("APPS_SCRIPT_URL no configurada. Saltando sync con Google Sheets.")
+        return False, "URL de Apps Script no configurada."
+
+    try:
+        rows = get_full_stock_for_sheet(conn)
+        if not rows:
+            log.warning("No hay datos de stock para sincronizar.")
+            return False, "Sin datos de stock."
+
+        # Construir payload para bulk_snapshot_pp
+        payload_rows = [
+            {
+                "descripcion":   str(desc).strip(),
+                "stock_pallets": int(pallets),
+                "stock_packs":   int(packs),
+            }
+            for desc, pallets, packs in rows
+        ]
+
+        payload = {
+            "action":         "bulk_snapshot_pp",
+            "snapshot_id":    f"reingreso_{date.today().isoformat()}",
+            "is_first_block": True,
+            "is_last_block":  True,
+            "rows":           payload_rows,
+        }
+
+        body    = json.dumps(payload).encode("utf-8")
+        req     = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        # Seguir redirecciones manualmente (Apps Script redirige a /exec)
+        opener  = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+        with opener.open(req, timeout=15) as resp:
+            raw  = resp.read().decode("utf-8")
+            data = json.loads(raw)
+
+        if data.get("ok"):
+            log.info("Google Sheets sincronizado: %s filas escritas.", data.get("wrote", "?"))
+            return True, f"Sheet actualizado ({data.get('wrote', '?')} productos)."
+        else:
+            log.warning("Apps Script respondio error: %s", data)
+            return False, f"Apps Script error: {data.get('error', raw)}"
+
+    except urllib.error.URLError as exc:
+        log.warning("Error de red al sincronizar sheet: %s", exc)
+        return False, f"Error de red: {exc}"
+    except Exception as exc:
+        log.warning("Error inesperado al sincronizar sheet: %s", exc)
+        return False, f"Error sync: {exc}"
+
+# ── CORE REINGRESO ────────────────────────────────────────────────────────────
 def reingresar_al_stock(conn, id_producto, lote, tipo_unidad, cantidad):
     """
     Transaccion atomica:
-    1. Inserta 'cantidad' filas en stock.
-    2. Descuenta/elimina las filas correspondientes en bajas (motivo='Venta').
-    Si algo falla hace ROLLBACK completo: ni stock ni bajas quedan alterados.
+    1. Inserta filas en stock.
+    2. Descuenta/elimina filas en bajas (motivo='Venta').
+    3. Sincroniza Google Sheet con el nuevo estado.
+    Si el paso 1 o 2 falla -> ROLLBACK completo.
+    El paso 3 (sheet) nunca aborta el reingreso.
     """
     pid         = int(id_producto)
     lote        = str(lote).strip()
@@ -262,6 +339,14 @@ def reingresar_al_stock(conn, id_producto, lote, tipo_unidad, cantidad):
 
     desc = get_product_desc(conn, pid)
     net_p, net_pk, warn = _neto_stock(conn, pid, schema, tstock)
+
+    # 3. Sincronizar Google Sheet (no aborta si falla)
+    sheet_ok, sheet_msg = sync_sheet_after_reingreso(conn)
+    if not sheet_ok:
+        warn = (warn + "\n" if warn else "") + f"⚠ Sheet no sincronizado: {sheet_msg}"
+    else:
+        log.info("Sheet sync: %s", sheet_msg)
+
     return pid, desc, lote, tipo_unidad, cantidad, net_p, net_pk, warn
 
 # ── UI ────────────────────────────────────────────────────────────────────────
