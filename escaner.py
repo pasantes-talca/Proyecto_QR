@@ -3,6 +3,7 @@ import sys
 import json
 import uuid
 from datetime import datetime
+import threading
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -37,12 +38,12 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 
 DEFAULT_PG = {
-    "host": os.getenv("TALCA_PG_HOST", "localhost"),
-    "port": int(os.getenv("TALCA_PG_PORT", "5432")),
-    "dbname": os.getenv("TALCA_PG_DB", "postgres"),
-    "user": os.getenv("TALCA_PG_USER", "postgres"),
-    "password": os.getenv("TALCA_PG_PASS", ""),
-    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),
+    "host":"10.242.4.13",
+    "port": 5432,
+    "dbname": "stock",
+    "user": "postgres",
+    "password": "Talca2025",
+    "client_encoding": "WIN1252",
     "schema": "produccion",
     "table_products": "productos",
     "table_stock": "stock",
@@ -50,7 +51,6 @@ DEFAULT_PG = {
     "table_sheet": "sheet",
 }
 
-# Para evitar que por error te complete miles de registros y se cuelgue
 MAX_AUTOFILL = 5000
 
 
@@ -80,12 +80,6 @@ def get_pg_config():
 
 
 def get_sheet_settings():
-    """
-    Opcional: si algún día querés mover URL/API KEY a config.json:
-    {
-      "sheet": { "webapp_url": "...", "api_key": "..." }
-    }
-    """
     data = load_config()
     sheet = data.get("sheet") if isinstance(data.get("sheet"), dict) else {}
     url = sheet.get("webapp_url") or SHEETS_WEBAPP_URL
@@ -135,13 +129,6 @@ def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
 
 
 def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int):
-    """
-    NUEVO (WebApp nuevo): action/type = "scan_pp"
-      {descripcion, stock_pallets, stock_packs}
-
-    Fallback (por si el WebApp fuera el viejo): type="update_row"
-      row: {descripcion, stock_pallets, stock_packs}
-    """
     _, api_key = get_sheet_settings()
 
     payload_new = {
@@ -172,13 +159,6 @@ def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int):
 
 
 def send_bulk_to_sheet(rows, chunk_size: int = 500):
-    """
-    NUEVO (WebApp nuevo): action/type = "bulk_snapshot_pp" por bloques
-      snapshot_id + block_index + is_first_block + is_last_block
-      rows: [{descripcion, stock_pallets, stock_packs}, ...]
-
-    Fallback (WebApp viejo): type="bulk" (un solo envío)
-    """
     _, api_key = get_sheet_settings()
 
     if rows is None:
@@ -237,7 +217,7 @@ def send_bulk_to_sheet(rows, chunk_size: int = 500):
             "rows": chunk
         }
 
-        res = _post_json_to_webapp(payload, timeout=60)
+        res = _post_json_to_webapp(payload, timeout=90)
         if not (isinstance(res, dict) and res.get("ok") is True):
             if isinstance(res, dict) and _looks_like_unknown_action(res):
                 payload_old = {"api_key": api_key, "type": "bulk", "rows": rows}
@@ -291,10 +271,6 @@ def normalize_date_iso(s: str):
 
 
 def parse_qr_payload(raw: str) -> dict:
-    """
-    Formato:
-    NS=000001|PRD=4910|DSC=...|LOT=240226|FEC=2026-02-24|VTO=2026-08-24
-    """
     raw = raw.strip()
     if "|" in raw and "=" in raw:
         parts = raw.split("|")
@@ -363,11 +339,9 @@ def get_product_desc(conn, id_producto: int) -> str:
 
 
 def qr_already_scanned(conn, id_producto: int, nro_serie: int, lote: str, descripcion_qr: str) -> bool:
-    """
-    Bloquea repetidos si ya existe en BD uno con:
-      - (id_producto + nro_serie + lote)  OR
-      - (descripcion + nro_serie + lote)
-    """
+    """Solo verifica duplicados sobre el registro PALLET (el de entrada principal).
+    El registro PACKS del mismo nro_serie se inserta junto al PALLET en parciales
+    y no debe triggear falso positivo."""
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -381,10 +355,12 @@ def qr_already_scanned(conn, id_producto: int, nro_serie: int, lote: str, descri
             SELECT 1
             FROM {schema}.{tstock} s
             JOIN {schema}.{tprod} p ON p.id = s.id_producto
-            WHERE
-              (s.id_producto = %s AND s.nro_serie = %s AND s.lote = %s)
-              OR
-              (LOWER(TRIM(p.descripcion)) = LOWER(TRIM(%s)) AND s.nro_serie = %s AND s.lote = %s)
+            WHERE s.tipo_unidad = 'PALLET'
+              AND (
+                (s.id_producto = %s AND s.nro_serie = %s AND s.lote = %s)
+                OR
+                (LOWER(TRIM(p.descripcion)) = LOWER(TRIM(%s)) AND s.nro_serie = %s AND s.lote = %s)
+              )
             LIMIT 1;
             """,
             (int(id_producto), int(nro_serie), str(lote), desc, int(nro_serie), str(lote)),
@@ -394,10 +370,6 @@ def qr_already_scanned(conn, id_producto: int, nro_serie: int, lote: str, descri
 
 def insert_one(conn, id_producto: int, nro_serie: int, lote: str, creacion_iso, venc_iso,
                tipo_unidad: str, packs: int):
-    """
-    Inserta 1 fila. Si ya existe (por UNIQUE), no rompe (DO NOTHING).
-    Devuelve True si insertó, False si ya existía.
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -416,11 +388,6 @@ def insert_one(conn, id_producto: int, nro_serie: int, lote: str, creacion_iso, 
 
 
 def insert_missing_between(conn, id_producto: int, lote: str, a: int, b: int, creacion_iso, venc_iso):
-    """
-    Inserta los del medio entre a y b (excluye endpoints).
-    Siempre como PALLET packs=0.
-    Devuelve (insertados, omitidos)
-    """
     lo = min(int(a), int(b))
     hi = max(int(a), int(b))
     gap = hi - lo - 1
@@ -451,37 +418,32 @@ def insert_missing_between(conn, id_producto: int, lote: str, a: int, b: int, cr
     return ins, skip
 
 
+# =======================
+#   STOCK NET
+# =======================
 def compute_net_stock(conn, id_producto: int):
-    """
-    Pallets netos:
-      ingresos pallets = COUNT(stock WHERE tipo_unidad='PALLET')
-      salidas pallets  = SUM(bajas.cantidad)
-    Packs netos:
-      ingresos packs = SUM(stock.packs WHERE tipo_unidad='PACKS')
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
     tbajas = cfg["table_bajas"]
 
     with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT COALESCE(COUNT(*),0) FROM {schema}.{tstock} WHERE id_producto=%s AND tipo_unidad='PALLET';",
-            (int(id_producto),),
-        )
-        in_pallets = int(cur.fetchone()[0] or 0)
-
-        cur.execute(
-            f"SELECT COALESCE(SUM(packs),0) FROM {schema}.{tstock} WHERE id_producto=%s AND tipo_unidad='PACKS';",
-            (int(id_producto),),
-        )
-        in_packs = int(cur.fetchone()[0] or 0)
-
-        cur.execute(
-            f"SELECT COALESCE(SUM(cantidad),0) FROM {schema}.{tbajas} WHERE id_producto=%s;",
-            (int(id_producto),),
-        )
-        out_pallets = int(cur.fetchone()[0] or 0)
+        cur.execute(f"""
+            SELECT
+                COALESCE(COUNT(CASE WHEN s.tipo_unidad = 'PALLET' THEN 1 END), 0) AS in_pallets,
+                COALESCE(SUM(s.packs), 0)                                          AS in_packs,
+                COALESCE((SELECT SUM(b.cantidad) FROM {schema}.{tbajas} b
+                           WHERE b.id_producto = %s), 0)                           AS out_pallets
+            FROM {schema}.{tstock} s
+            WHERE s.id_producto = %s;
+        """, (int(id_producto), int(id_producto)))
+        row = cur.fetchone()
+        if row:
+            in_pallets = int(row[0])
+            in_packs = int(row[1])
+            out_pallets = int(row[2])
+        else:
+            in_pallets = in_packs = out_pallets = 0
 
     net_pallets = max(in_pallets - out_pallets, 0)
     net_packs = max(in_packs, 0)
@@ -531,9 +493,54 @@ def fetch_all_sheet_rows(conn):
 
 
 # =======================
+#   REFRESH SHEET (Google en segundo plano)
+# =======================
+def refresh_sheet_background(conn, id_producto: int, on_warn=None):
+    """Actualiza solo la tabla sheet en Postgres.
+    El envío a Google Sheet lo maneja exclusivamente auto_sync_bulk_debounced
+    para evitar requests simultáneos que generan timeout."""
+    net_pallets, net_packs = compute_net_stock(conn, id_producto)
+    upsert_sheet(conn, id_producto, net_pallets, net_packs)
+
+
+# =======================
+#   AUTO BULK SYNC con DEBOUNCE
+#   Espera N segundos desde el último escaneo y recién entonces sincroniza.
+#   Si llega otro escaneo antes de que expire el timer, lo reinicia.
+#   Así nunca se solapan dos requests simultáneos al Sheet.
+# =======================
+_bulk_sync_timer = None
+_bulk_sync_lock  = threading.Lock()
+
+def auto_sync_bulk_debounced(conn, on_warn=None, delay_seconds: float = 4.0):
+    global _bulk_sync_timer
+
+    def _run():
+        try:
+            rows = fetch_all_sheet_rows(conn)
+            res  = send_bulk_to_sheet(rows)
+            if not (isinstance(res, dict) and res.get("ok") is True):
+                if on_warn:
+                    on_warn(f"⚠️ Auto-sync Sheet: respuesta inválida: {res}")
+        except Exception as e:
+            if on_warn:
+                on_warn(f"⚠️ Auto-sync Sheet error: {e}")
+
+    with _bulk_sync_lock:
+        global _bulk_sync_timer
+        if _bulk_sync_timer is not None:
+            _bulk_sync_timer.cancel()
+        _bulk_sync_timer = threading.Timer(delay_seconds, _run)
+        _bulk_sync_timer.daemon = True
+        _bulk_sync_timer.start()
+
+
+# =======================
 #   UI
 # =======================
 def main():
+    global root, status_var
+
     conn = pg_connect()
 
     root = tb.Window(themename="minty")
@@ -542,28 +549,6 @@ def main():
 
     tb.Label(root, text="Escaneo de ENTRADA", font=("Segoe UI", 20, "bold")).pack(pady=14)
     tb.Label(root, font=("Segoe UI", 10), justify="center").pack(pady=4)
-
-    def on_sync_all():
-        try:
-            rows = fetch_all_sheet_rows(conn)
-            res = send_bulk_to_sheet(rows)
-
-            if isinstance(res, dict) and res.get("ok") is True:
-                mode = res.get("mode", "¿?")
-                wrote = res.get("wrote_total", res.get("updated", "¿?"))
-                blocks = res.get("blocks", "1")
-                snap = res.get("snapshot_id", "")
-
-                extra = f"\nSnapshot: {snap}" if snap else ""
-                messagebox.showinfo(
-                    "Sync Google Sheet",
-                    f"✅ Sync OK.\nFilas enviadas: {len(rows)}\nModo: {mode}\nEscritas/actualizadas: {wrote}\nBloques: {blocks}{extra}"
-                )
-            else:
-                messagebox.showerror("Sync Google Sheet", f"❌ Respuesta inválida:\n{res}")
-
-        except Exception as e:
-            messagebox.showerror("Sync Google Sheet", f"❌ Error:\n{e}")
 
     # Input QR
     scan_var = tb.StringVar()
@@ -603,16 +588,44 @@ def main():
         wraplength=940
     ).pack(pady=14)
 
-    # ---- BOTÓN ABAJO DE TODO ----
+    # ---- BOTÓN ABAJO (sigue disponible para sync manual si se necesita) ----
     footer = tb.Frame(root)
     footer.pack(side=BOTTOM, fill=X, pady=(0, 14))
-    tb.Button(footer, text="ENVIAR AL SHEET", bootstyle=SUCCESS, command=on_sync_all).pack()
+    tb.Button(
+        footer,
+        text="ENVIAR AL SHEET (manual)",
+        bootstyle=SUCCESS,
+        command=lambda: _manual_sync()
+    ).pack()
+
+    def _manual_sync():
+        try:
+            rows = fetch_all_sheet_rows(conn)
+            res = send_bulk_to_sheet(rows)
+            if isinstance(res, dict) and res.get("ok") is True:
+                mode = res.get("mode", "¿?")
+                wrote = res.get("wrote_total", res.get("updated", "¿?"))
+                blocks = res.get("blocks", "1")
+                snap = res.get("snapshot_id", "")
+                extra = f"\nSnapshot: {snap}" if snap else ""
+                messagebox.showinfo(
+                    "Sync Google Sheet",
+                    f"✅ Sync OK.\nFilas enviadas: {len(rows)}\nModo: {mode}\nEscritas/actualizadas: {wrote}\nBloques: {blocks}{extra}"
+                )
+            else:
+                messagebox.showerror("Sync Google Sheet", f"❌ Respuesta inválida:\n{res}")
+        except Exception as e:
+            messagebox.showerror("Sync Google Sheet", f"❌ Error:\n{e}")
 
     # cache en memoria: último nro_serie por (id_producto, lote)
-    last_seen = {}  # key=(pid,lote) -> last_serie
-
-    # si está esperando packs
+    last_seen = {}
     pending = {"data": None}
+
+    def _on_sheet_warn(msg):
+        def _update():
+            current = status_var.get()
+            status_var.set(f"{current}\n{msg}")
+        root.after(0, _update)
 
     def set_packs_state():
         if is_partial_var.get():
@@ -624,7 +637,9 @@ def main():
 
     def reset_after_commit():
         scan_var.set("")
-        packs_var.set("")
+        # ⚠️ NO limpiamos packs_var al resetear, para que el operador
+        # no tenga que volver a tipear la cantidad en escaneos parciales continuos.
+        # Si quiere cambiarla, la edita manualmente.
         pending["data"] = None
         entry_scan.focus_set()
 
@@ -649,7 +664,6 @@ def main():
         if not product_exists(conn, pid):
             raise ValueError(f"El producto {pid} no existe en produccion.productos.")
 
-        # 🔒 BLOQUEO DE REPETIDOS (antes de insertar)
         if qr_already_scanned(conn, pid, serie, lote, dsc_qr):
             root.bell()
             status_var.set(
@@ -660,7 +674,7 @@ def main():
             reset_after_commit()
             return
 
-        # 1) Inserto el QR escaneado
+        # --- Insertar registro PALLET (siempre, incluso en parcial) ---
         inserted = insert_one(
             conn,
             id_producto=pid,
@@ -668,11 +682,10 @@ def main():
             lote=lote,
             creacion_iso=cre,
             venc_iso=vto,
-            tipo_unidad=unit_type,
-            packs=packs
+            tipo_unidad="PALLET",
+            packs=0
         )
 
-        # Si por UNIQUE igual no insertó, lo tratamos como repetido
         if not inserted:
             root.bell()
             status_var.set(
@@ -683,41 +696,41 @@ def main():
             reset_after_commit()
             return
 
-        # 2) Completo los del medio si hay continuidad
+        # --- Si es parcial, guardar los packs en el mismo registro PALLET ---
+        if unit_type == "PACKS" and packs > 0:
+            cfg = get_pg_config()
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""UPDATE {cfg['schema']}.{cfg['table_stock']}
+                           SET packs = %s
+                           WHERE id_producto = %s AND nro_serie = %s AND lote = %s;""",
+                    (int(packs), int(pid), int(serie), str(lote))
+                )
+
         key = (pid, lote)
         if key in last_seen:
             prev = int(last_seen[key])
             insert_missing_between(conn, pid, lote, prev, serie, cre, vto)
 
-        # 3) Actualizo último visto
         last_seen[key] = serie
 
-        # 4) Actualizo sheet en Postgres
-        net_pallets, net_packs = compute_net_stock(conn, pid)
-        upsert_sheet(conn, pid, net_pallets, net_packs)
+        # Actualiza Postgres + envia fila individual al Sheet en background
+        refresh_sheet_background(conn, pid, on_warn=_on_sheet_warn)
 
-        # 5) Envío al Google Sheet (1 fila) -> RESUMEN: ENVIADO / ERROR + INFO QR
-        desc_db = get_product_desc(conn, pid)
+        # Auto bulk-sync con debounce: espera 6s desde el ultimo escaneo
+        auto_sync_bulk_debounced(conn, on_warn=_on_sheet_warn)
+
         root.bell()
+        unit_label = f"PARCIAL ({packs} packs)" if unit_type == "PACKS" else "PALLET completo"
+        status_var.set(
+            f"ENVIADO A BD [{unit_label}] - Sheet sincronizando...\n\n" +
+            format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
+        )
 
-        enviado_ok = False
-        detalle_error = ""
+        # --- Si era parcial, desactivar toggle automaticamente ---
+        if unit_type == "PACKS":
+            is_partial_var.set(False)   # dispara set_packs_state() -> limpia packs y deshabilita campo
 
-        try:
-            res = send_update_row_to_sheet(desc_db, net_pallets, net_packs)
-            enviado_ok = isinstance(res, dict) and res.get("ok") is True
-            if not enviado_ok:
-                detalle_error = str(res)
-        except Exception as e:
-            enviado_ok = False
-            detalle_error = str(e)
-
-        line1 = "ENVIADO" if enviado_ok else "ERROR"
-        msg = f"{line1}\n\n" + format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
-        if not enviado_ok and detalle_error:
-            msg = f"{msg}\n\nDetalle: {detalle_error}"
-
-        status_var.set(msg)
         reset_after_commit()
 
     def on_scan_enter(event=None):
@@ -730,14 +743,24 @@ def main():
         try:
             data = parse_qr_payload(raw)
 
-            # NORMAL
             if not is_partial_var.get():
+                # Modo pallet completo: commit inmediato
                 commit_scan(data, unit_type="PALLET", packs=0)
                 return
 
-            # PARCIAL: pedir packs, pero mostrar detalle igual que cuando se envía
-            pending["data"] = data
+            # ✅ CAMBIO 1: Si ya hay un valor de packs cargado, commitear directo
+            packs_raw = packs_var.get().strip()
+            if packs_raw:
+                try:
+                    packs_val = int(packs_raw)
+                    if packs_val > 0:
+                        commit_scan(data, unit_type="PACKS", packs=packs_val)
+                        return
+                except ValueError:
+                    pass  # valor inválido → caer al flujo manual
 
+            # Si no hay packs cargados, pedir al operador
+            pending["data"] = data
             pid = int(data["id_producto"])
             lote = str(data["lote"]).strip()
             serie = int(data["nro_serie"])
