@@ -1,5 +1,5 @@
 import os, sys, json, logging
-from datetime import date
+from datetime import date, datetime
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -12,19 +12,14 @@ except ImportError:
     psycopg2 = None
 
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-    )
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-    HAS_REPORTLAB = True
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    openpyxl_ok = True
 except ImportError:
-    HAS_REPORTLAB = False
+    openpyxl_ok = False
 
-# ── LOGGING ──────────────────────────────────────────────────────────────────
+# ── LOGGING ───────────────────────────────────────────────────────────────────
 def _log_file_path():
     base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
     return os.path.join(base, "defectos.log")
@@ -47,20 +42,23 @@ APP_DIR     = get_app_dir()
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 DEFAULT_PG = {
-    "host":     os.getenv("TALCA_PG_HOST",     "localhost"),
-    "port":     int(os.getenv("TALCA_PG_PORT", "5432")),
-    "dbname":   os.getenv("TALCA_PG_DB",       "postgres"),
-    "user":     os.getenv("TALCA_PG_USER",     "postgres"),
-    "password": os.getenv("TALCA_PG_PASS",     ""),
-    "schema":   "produccion",
+    "host":"10.242.4.13",
+    "port": 5432,
+    "dbname": "stock",
+    "user": "postgres",
+    "password": "Talca2025",
+    "client_encoding": "WIN1252",
+    "schema": "produccion",
     "table_products": "productos",
-    "table_defectos": "defectos",
+    "table_stock": "stock",
+    "table_bajas": "bajas",
+    "table_sheet": "sheet",
 }
 
 MOTIVOS = [
     "Sin gas",
     "Roto",
-    "Etiqueta desteñida",
+    "Etiqueta deste\u00f1ida",
     "Envase deforme",
     "Problema Tapas",
     "Sabor",
@@ -112,9 +110,9 @@ def get_all_products(conn):
         return cur.fetchall()
 
 def registrar_defecto(conn, id_producto, cantidad, lote, motivo):
-    cfg    = get_pg_config()
-    schema = cfg["schema"]
-    tdef   = cfg["table_defectos"]
+    cfg      = get_pg_config()
+    schema   = cfg["schema"]
+    tdef     = cfg["table_defectos"]
     hoy      = date.today()
     lote_val = int(lote) if lote and str(lote).strip().isdigit() else None
     with conn.cursor() as cur:
@@ -122,8 +120,7 @@ def registrar_defecto(conn, id_producto, cantidad, lote, motivo):
             f"""
             INSERT INTO {schema}.{tdef}
                 (fecha, id_producto, cantidad, lote, motivo)
-            VALUES
-                (%s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s);
             """,
             (hoy, int(id_producto), int(cantidad), lote_val, motivo),
         )
@@ -131,255 +128,267 @@ def registrar_defecto(conn, id_producto, cantidad, lote, motivo):
     log.info("Defecto registrado: pid=%s cant=%s lote=%s motivo=%s",
              id_producto, cantidad, lote_val, motivo)
 
-def get_defectos_reporte(conn, fecha_ini, fecha_fin):
-    """
-    Devuelve filas agrupadas por producto y motivo entre las fechas dadas.
-    Retorna: [(descripcion, motivo, total_cantidad), ...]
-    """
+def get_reporte_defectos(conn, fecha_inicio, fecha_fin):
     cfg    = get_pg_config()
     schema = cfg["schema"]
     tdef   = cfg["table_defectos"]
     tprod  = cfg["table_products"]
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT
-                p.descripcion,
-                d.motivo,
-                SUM(d.cantidad) AS total
+            SELECT p.descripcion, d.motivo, SUM(d.cantidad) AS total
             FROM {schema}.{tdef} d
             INNER JOIN {schema}.{tprod} p ON p.id = d.id_producto
             WHERE d.fecha BETWEEN %s AND %s
             GROUP BY p.descripcion, d.motivo
             ORDER BY p.descripcion ASC, d.motivo ASC;
-        """, (fecha_ini, fecha_fin))
+        """, (fecha_inicio, fecha_fin))
         return cur.fetchall()
 
-# ── PDF REPORT ────────────────────────────────────────────────────────────────
-def generar_pdf(filepath, fecha_ini, fecha_fin, rows):
-    """
-    Genera un PDF con tabla agrupada por producto y motivo.
-    rows: [(descripcion, motivo, cantidad), ...]
-    """
-    doc = SimpleDocTemplate(
-        filepath,
-        pagesize=A4,
-        rightMargin=2*cm, leftMargin=2*cm,
-        topMargin=2.5*cm, bottomMargin=2*cm,
-    )
+# ── GENERADOR EXCEL ───────────────────────────────────────────────────────────
+def generar_excel_reporte(filepath, filas, fecha_inicio, fecha_fin):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Defectos"
 
-    styles = getSampleStyleSheet()
-    style_title = ParagraphStyle(
-        "titulo", parent=styles["Title"],
-        fontSize=18, textColor=colors.HexColor("#1a5276"),
-        spaceAfter=6, alignment=TA_CENTER,
-    )
-    style_sub = ParagraphStyle(
-        "subtitulo", parent=styles["Normal"],
-        fontSize=11, textColor=colors.HexColor("#555555"),
-        spaceAfter=4, alignment=TA_CENTER,
-    )
-    style_footer = ParagraphStyle(
-        "footer", parent=styles["Normal"],
-        fontSize=9, textColor=colors.HexColor("#888888"),
-        alignment=TA_CENTER,
-    )
+    AZUL_OSC  = "1A5276"
+    AZUL_FILA = "D6EAF8"
+    VERDE     = "D5F5E3"
+    BLANCO    = "FFFFFF"
 
-    story = []
+    borde_fino  = Side(style="thin",   color="AAB7B8")
+    borde_medio = Side(style="medium", color="1A5276")
+    border_full = Border(left=borde_fino, right=borde_fino,
+                         top=borde_fino,  bottom=borde_fino)
+    border_top  = Border(left=borde_fino, right=borde_fino,
+                         top=borde_medio, bottom=borde_fino)
 
-    # Encabezado
-    story.append(Paragraph("Reporte de Defectos", style_title))
-    story.append(Paragraph(
-        f"Período: {fecha_ini.strftime('%d/%m/%Y')}  —  {fecha_fin.strftime('%d/%m/%Y')}",
-        style_sub,
-    ))
-    story.append(Spacer(1, 0.4*cm))
-    story.append(HRFlowable(width="100%", thickness=1.5,
-                             color=colors.HexColor("#1a5276")))
-    story.append(Spacer(1, 0.5*cm))
+    f_titulo   = Font(name="Arial", size=16, bold=True, color=AZUL_OSC)
+    f_subtit   = Font(name="Arial", size=10, color="555555")
+    f_header   = Font(name="Arial", size=10, bold=True, color=BLANCO)
+    f_prod     = Font(name="Arial", size=10, bold=True, color=AZUL_OSC)
+    f_dato     = Font(name="Arial", size=10)
+    f_subtotal = Font(name="Arial", size=10, bold=True)
+    f_total    = Font(name="Arial", size=11, bold=True, color=BLANCO)
 
-    if not rows:
-        story.append(Paragraph("No se encontraron defectos en el período seleccionado.",
-                                styles["Normal"]))
-        doc.build(story)
-        return
+    alin_centro = Alignment(horizontal="center", vertical="center")
+    alin_izq    = Alignment(horizontal="left",   vertical="center", indent=1)
+    alin_der    = Alignment(horizontal="right",  vertical="center")
 
-    # ── Construir tabla ────────────────────────────────────────────────────
-    # Agrupar subtotales por producto
-    from collections import defaultdict
-    subtotales = defaultdict(int)
-    for desc, motivo, cant in rows:
-        subtotales[desc] += int(cant)
-    total_general = sum(subtotales.values())
+    ws.merge_cells("A1:C1")
+    ws["A1"] = "Reporte de Defectos"
+    ws["A1"].font = f_titulo
+    ws["A1"].alignment = alin_centro
 
-    header = ["Producto", "Motivo", "Cantidad"]
-    data   = [header]
+    ws.merge_cells("A2:C2")
+    ws["A2"] = f"Periodo: {fecha_inicio.strftime('%d/%m/%Y')}  al  {fecha_fin.strftime('%d/%m/%Y')}"
+    ws["A2"].font = f_subtit
+    ws["A2"].alignment = alin_centro
 
-    ultimo_prod = None
-    for desc, motivo, cant in rows:
-        if desc != ultimo_prod:
-            ultimo_prod = desc
-        data.append([desc, motivo, str(int(cant))])
+    ws.merge_cells("A3:C3")
+    ws["A3"] = f"Generado el: {date.today().strftime('%d/%m/%Y')}"
+    ws["A3"].font = f_subtit
+    ws["A3"].alignment = alin_centro
 
-        # Si es el último registro de este producto, agrego subtotal
-        # Busco si el siguiente es distinto
-        idx = rows.index((desc, motivo, cant))
-        es_ultimo = (idx == len(rows) - 1) or (rows[idx + 1][0] != desc)
-        if es_ultimo:
-            data.append(["", f"Subtotal  {desc}", str(subtotales[desc])])
+    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[2].height = 18
+    ws.row_dimensions[3].height = 18
+    ws.append([])
 
-    # Fila total general
-    data.append(["TOTAL GENERAL", "", str(total_general)])
+    row_header = 5
+    for col, h in enumerate(["Producto", "Motivo", "Cantidad"], start=1):
+        cell = ws.cell(row=row_header, column=col, value=h)
+        cell.font = f_header
+        cell.fill = PatternFill("solid", fgColor=AZUL_OSC)
+        cell.alignment = alin_centro
+        cell.border = border_full
+    ws.row_dimensions[row_header].height = 20
 
-    col_widths = [9*cm, 5.5*cm, 2.5*cm]
-    tabla = Table(data, colWidths=col_widths, repeatRows=1)
+    if not filas:
+        ws.merge_cells("A6:C6")
+        ws["A6"] = "No se encontraron defectos en el periodo seleccionado."
+        ws["A6"].font = Font(name="Arial", size=10, italic=True, color="888888")
+        ws["A6"].alignment = alin_centro
+    else:
+        productos = {}
+        for desc, motivo, total in filas:
+            productos.setdefault(desc, []).append((motivo, int(total)))
 
-    # Estilo de la tabla
-    n    = len(data)
-    ts   = TableStyle([
-        # Encabezado
-        ("BACKGROUND",   (0, 0), (-1, 0),  colors.HexColor("#1a5276")),
-        ("TEXTCOLOR",    (0, 0), (-1, 0),  colors.white),
-        ("FONTNAME",     (0, 0), (-1, 0),  "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1, 0),  11),
-        ("ALIGN",        (2, 0), (2, 0),   "CENTER"),
-        ("BOTTOMPADDING",(0, 0), (-1, 0),  8),
-        ("TOPPADDING",   (0, 0), (-1, 0),  8),
+        current_row   = row_header + 1
+        subtotal_rows = []
+        alt = False
 
-        # Cuerpo
-        ("FONTNAME",     (0, 1), (-1, -2), "Helvetica"),
-        ("FONTSIZE",     (0, 1), (-1, -2), 9),
-        ("TOPPADDING",   (0, 1), (-1, -2), 5),
-        ("BOTTOMPADDING",(0, 1), (-1, -2), 5),
-        ("ALIGN",        (2, 1), (2, -1),  "CENTER"),
-        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+        for desc, detalle in productos.items():
+            first_data_row = current_row
 
-        # Grilla
-        ("GRID",         (0, 0), (-1, -2), 0.4, colors.HexColor("#cccccc")),
-        ("LINEBELOW",    (0, 0), (-1, 0),  1.5, colors.HexColor("#1a5276")),
+            for motivo, cant in detalle:
+                bg  = AZUL_FILA if alt else BLANCO
+                alt = not alt
 
-        # Fila total general
-        ("BACKGROUND",   (0, -1), (-1, -1), colors.HexColor("#d5e8f7")),
-        ("FONTNAME",     (0, -1), (-1, -1), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, -1), (-1, -1), 10),
-        ("LINEABOVE",    (0, -1), (-1, -1), 1.5, colors.HexColor("#1a5276")),
-    ])
+                c_prod = ws.cell(row=current_row, column=1,
+                                 value=desc if motivo == detalle[0][0] else "")
+                c_prod.font      = f_prod if motivo == detalle[0][0] else f_dato
+                c_prod.fill      = PatternFill("solid", fgColor=bg)
+                c_prod.alignment = alin_izq
+                c_prod.border    = border_full
 
-    # Colorear filas alternas (solo filas de datos, no subtotales ni total)
-    fila_data = 1
-    for i, row in enumerate(data[1:], start=1):
-        if row[0] and row[0] != "TOTAL GENERAL":
-            if fila_data % 2 == 0:
-                ts.add("BACKGROUND", (0, i), (-1, i), colors.HexColor("#eaf4fb"))
-            fila_data += 1
-        elif row[1].startswith("Subtotal"):
-            # Filas de subtotal
-            ts.add("BACKGROUND",  (0, i), (-1, i), colors.HexColor("#d6eaf8"))
-            ts.add("FONTNAME",    (0, i), (-1, i), "Helvetica-Bold")
-            ts.add("FONTSIZE",    (0, i), (-1, i), 9)
-            ts.add("LINEABOVE",   (0, i), (-1, i), 0.8, colors.HexColor("#1a5276"))
+                c_mot = ws.cell(row=current_row, column=2, value=motivo)
+                c_mot.font      = f_dato
+                c_mot.fill      = PatternFill("solid", fgColor=bg)
+                c_mot.alignment = alin_izq
+                c_mot.border    = border_full
 
-    tabla.setStyle(ts)
-    story.append(tabla)
+                c_cant = ws.cell(row=current_row, column=3, value=cant)
+                c_cant.font          = f_dato
+                c_cant.fill          = PatternFill("solid", fgColor=bg)
+                c_cant.alignment     = alin_der
+                c_cant.border        = border_full
+                c_cant.number_format = "#,##0"
 
-    # Pie
-    story.append(Spacer(1, 0.8*cm))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#aaaaaa")))
-    story.append(Spacer(1, 0.2*cm))
-    story.append(Paragraph(
-        f"Generado el {date.today().strftime('%d/%m/%Y')}  |  Total de defectos: {total_general}",
-        style_footer,
-    ))
+                ws.row_dimensions[current_row].height = 18
+                current_row += 1
 
-    doc.build(story)
-    log.info("PDF generado: %s", filepath)
+            sub_row = current_row
+            subtotal_rows.append(sub_row)
 
-# ── VENTANA DE REPORTE ────────────────────────────────────────────────────────
-class ReporteWindow:
+            c1 = ws.cell(row=sub_row, column=1, value=f"Subtotal \u2014 {desc}")
+            c1.font = f_subtotal
+            c1.fill = PatternFill("solid", fgColor=VERDE)
+            c1.alignment = alin_izq
+            c1.border = border_top
+
+            c2 = ws.cell(row=sub_row, column=2, value="")
+            c2.fill   = PatternFill("solid", fgColor=VERDE)
+            c2.border = border_top
+
+            c3 = ws.cell(row=sub_row, column=3,
+                         value=f"=SUM(C{first_data_row}:C{sub_row - 1})")
+            c3.font          = f_subtotal
+            c3.fill          = PatternFill("solid", fgColor=VERDE)
+            c3.alignment     = alin_der
+            c3.border        = border_top
+            c3.number_format = "#,##0"
+
+            ws.row_dimensions[sub_row].height = 18
+            current_row += 2  # fila vacía entre productos
+
+        tot_row = current_row
+        c1 = ws.cell(row=tot_row, column=1, value="TOTAL GENERAL DE DEFECTOS")
+        c1.font = f_total
+        c1.fill = PatternFill("solid", fgColor=AZUL_OSC)
+        c1.alignment = alin_izq
+        c1.border = border_full
+
+        c2 = ws.cell(row=tot_row, column=2, value="")
+        c2.fill   = PatternFill("solid", fgColor=AZUL_OSC)
+        c2.border = border_full
+
+        c3 = ws.cell(row=tot_row, column=3,
+                     value="=SUM(" + ",".join(f"C{r}" for r in subtotal_rows) + ")")
+        c3.font          = f_total
+        c3.fill          = PatternFill("solid", fgColor=AZUL_OSC)
+        c3.alignment     = alin_der
+        c3.border        = border_full
+        c3.number_format = "#,##0"
+
+        ws.row_dimensions[tot_row].height = 22
+
+    ws.column_dimensions["A"].width = 45
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 14
+    ws.freeze_panes = "A6"
+
+    wb.save(filepath)
+    log.info("Excel generado: %s", filepath)
+
+
+# ── VENTANA REPORTE ───────────────────────────────────────────────────────────
+class ReporteWindow(tb.Toplevel):
     def __init__(self, parent, conn):
+        super().__init__(parent)
         self.conn = conn
-        self.win  = tb.Toplevel(parent)
-        self.win.title("Generar Reporte PDF")
-        self.win.geometry("420x300")
-        self.win.resizable(False, False)
-        self.win.grab_set()
+        self.title("Generar Reporte Excel")
+        self.geometry("480x310")
+        self.resizable(False, False)
         self._build()
 
     def _build(self):
-        win = self.win
-        tb.Label(win, text="Reporte de Defectos",
-                 font=("Segoe UI", 16, "bold")).pack(pady=(20, 6))
-        tb.Label(win, text="Seleccione el rango de fechas",
-                 font=("Segoe UI", 10), foreground="gray").pack()
+        tb.Label(self, text="Reporte de Defectos por Periodo",
+                 font=("Segoe UI", 14, "bold")).pack(pady=(20, 10))
 
-        frame = tb.Frame(win)
-        frame.pack(pady=20, padx=30, fill="x")
+        frame = tb.LabelFrame(self, text="Seleccionar periodo")
+        frame.pack(padx=30, pady=5, fill="x", ipadx=8, ipady=8)
+
+        hoy = date.today().strftime("%d/%m/%Y")
 
         # Fecha inicio
         tb.Label(frame, text="Fecha inicio:", font=("Segoe UI", 11)).grid(
-            row=0, column=0, sticky="e", padx=8, pady=10)
-        self.ini_entry = tb.DateEntry(frame, dateformat="%Y-%m-%d",
-                                      bootstyle=PRIMARY, width=14)
-        self.ini_entry.grid(row=0, column=1, sticky="w", padx=8)
+            row=0, column=0, sticky="e", padx=10, pady=10)
+        self.ini_var = StringVar(value=hoy)
+        tb.Entry(frame, textvariable=self.ini_var, width=14,
+                 font=("Segoe UI", 11)).grid(row=0, column=1, sticky="w", padx=10, pady=10)
+        tb.Label(frame, text="(dd/mm/aaaa)", font=("Segoe UI", 9, "italic"),
+                 foreground="gray").grid(row=0, column=2, sticky="w")
 
         # Fecha fin
         tb.Label(frame, text="Fecha fin:", font=("Segoe UI", 11)).grid(
-            row=1, column=0, sticky="e", padx=8, pady=10)
-        self.fin_entry = tb.DateEntry(frame, dateformat="%Y-%m-%d",
-                                      bootstyle=PRIMARY, width=14)
-        self.fin_entry.grid(row=1, column=1, sticky="w", padx=8)
+            row=1, column=0, sticky="e", padx=10, pady=10)
+        self.fin_var = StringVar(value=hoy)
+        tb.Entry(frame, textvariable=self.fin_var, width=14,
+                 font=("Segoe UI", 11)).grid(row=1, column=1, sticky="w", padx=10, pady=10)
+        tb.Label(frame, text="(dd/mm/aaaa)", font=("Segoe UI", 9, "italic"),
+                 foreground="gray").grid(row=1, column=2, sticky="w")
 
-        # Estado
         self.status_var = StringVar(value="")
-        tb.Label(win, textvariable=self.status_var,
-                 font=("Segoe UI", 9), foreground="#c0392b",
-                 wraplength=380).pack(pady=4)
+        tb.Label(self, textvariable=self.status_var, font=("Segoe UI", 10),
+                 foreground="#555", wraplength=420).pack(pady=6, padx=20)
 
-        # Botón
-        tb.Button(win, text="  GENERAR PDF  ", bootstyle=PRIMARY,
-                  width=22, command=self._generar).pack(pady=6)
+        self.btn = tb.Button(self, text="  GENERAR EXCEL  ",
+                             bootstyle=SUCCESS, width=22,
+                             command=self._on_generar)
+        self.btn.pack(pady=8)
 
-    def _generar(self):
-        if not HAS_REPORTLAB:
-            messagebox.showerror(
-                "Falta librería",
-                "Instala reportlab:\n  pip install reportlab",
-                parent=self.win,
-            )
+    def _on_generar(self):
+        if not openpyxl_ok:
+            messagebox.showerror("Falta libreria",
+                                 "Instala openpyxl:\n  pip install openpyxl",
+                                 parent=self)
             return
         try:
-            fecha_ini = self.ini_entry.entry.get().strip()
-            fecha_fin = self.fin_entry.entry.get().strip()
-            from datetime import datetime
-            fi = datetime.strptime(fecha_ini, "%Y-%m-%d").date()
-            ff = datetime.strptime(fecha_fin, "%Y-%m-%d").date()
-            if fi > ff:
-                raise ValueError("La fecha inicio no puede ser mayor a la fecha fin.")
-        except ValueError as exc:
-            self.status_var.set(f"⚠ {exc}")
+            fecha_inicio = datetime.strptime(self.ini_var.get().strip(), "%d/%m/%Y").date()
+            fecha_fin    = datetime.strptime(self.fin_var.get().strip(), "%d/%m/%Y").date()
+        except ValueError:
+            self.status_var.set("\u26a0 Formato incorrecto. Usar dd/mm/aaaa (ej: 01/03/2026)")
             return
 
+        if fecha_inicio > fecha_fin:
+            self.status_var.set("\u26a0 La fecha inicio debe ser menor o igual a la fecha fin.")
+            return
+
+        nombre = f"reporte_defectos_{fecha_inicio}_{fecha_fin}.xlsx"
         filepath = filedialog.asksaveasfilename(
-            parent=self.win,
-            title="Guardar reporte PDF",
-            defaultextension=".pdf",
-            initialfile=f"defectos_{fi}_{ff}.pdf",
-            filetypes=[("PDF files", "*.pdf")],
+            parent=self, title="Guardar reporte Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx")],
+            initialfile=nombre,
         )
         if not filepath:
             return
 
+        self.btn.config(state="disabled", text="Generando\u2026")
+        self.status_var.set("Consultando base de datos\u2026")
+        self.update_idletasks()
+
         try:
-            rows = get_defectos_reporte(self.conn, fi, ff)
-            generar_pdf(filepath, fi, ff, rows)
-            messagebox.showinfo(
-                "Listo",
-                f"PDF generado correctamente.\n{filepath}",
-                parent=self.win,
-            )
-            self.win.destroy()
+            filas = get_reporte_defectos(self.conn, fecha_inicio, fecha_fin)
+            generar_excel_reporte(filepath, filas, fecha_inicio, fecha_fin)
+            self.status_var.set("\u2714 Excel guardado correctamente.")
+            messagebox.showinfo("Listo", f"Reporte generado:\n{filepath}", parent=self)
         except Exception as exc:
-            log.exception("Error al generar PDF")
-            self.status_var.set(f"Error: {exc}")
+            log.exception("Error al generar Excel")
+            self.status_var.set(f"\u2718 Error: {exc}")
+        finally:
+            self.btn.config(state="normal", text="  GENERAR EXCEL  ")
+
 
 # ── UI PRINCIPAL ──────────────────────────────────────────────────────────────
 class DefectosApp:
@@ -395,11 +404,9 @@ class DefectosApp:
     def _build_ui(self):
         root = self.root
 
-        # Título
         tb.Label(root, text="Registro de Defectos",
                  font=("Segoe UI", 22, "bold")).pack(pady=(24, 12))
 
-        # Formulario
         frame = tb.LabelFrame(root, text="Datos del defecto")
         frame.pack(pady=6, padx=50, fill="x", ipadx=10, ipady=10)
         frame.columnconfigure(1, weight=1)
@@ -408,11 +415,13 @@ class DefectosApp:
         tb.Label(frame, text="Producto:", font=("Segoe UI", 11)).grid(
             row=0, column=0, sticky="e", padx=10, pady=10)
         prods = get_all_products(self.conn)
-        self.prod_options = [f"{pid} — {desc}" for pid, desc in prods]
+        self.prod_options = [f"{pid} \u2014 {desc}" for pid, desc in prods]
         self.prod_var = StringVar()
         self.prod_combo = tb.Combobox(frame, textvariable=self.prod_var,
-                                      values=self.prod_options, state="readonly", width=55)
-        self.prod_combo.grid(row=0, column=1, columnspan=2, sticky="w", padx=10, pady=10)
+                                      values=self.prod_options,
+                                      state="readonly", width=55)
+        self.prod_combo.grid(row=0, column=1, columnspan=2,
+                             sticky="w", padx=10, pady=10)
         if self.prod_options:
             self.prod_combo.current(0)
 
@@ -423,45 +432,49 @@ class DefectosApp:
         self.cant_var = StringVar(value="1")
         tb.Entry(frame, textvariable=self.cant_var, width=14,
                  validate="key", validatecommand=vcmd,
-                 font=("Segoe UI", 11)).grid(row=1, column=1, sticky="w", padx=10, pady=10)
+                 font=("Segoe UI", 11)).grid(row=1, column=1, sticky="w",
+                                             padx=10, pady=10)
 
-        # Lote (opcional)
-        tb.Label(frame, text="Nº de lote (opcional):", font=("Segoe UI", 11)).grid(
+        # Lote
+        tb.Label(frame, text="N\u00ba de lote (opcional):", font=("Segoe UI", 11)).grid(
             row=2, column=0, sticky="e", padx=10, pady=10)
         lote_vcmd = (root.register(lambda v: v == "" or v.isdigit()), "%P")
         self.lote_var = StringVar()
         tb.Entry(frame, textvariable=self.lote_var, width=20,
                  validate="key", validatecommand=lote_vcmd,
-                 font=("Segoe UI", 11)).grid(row=2, column=1, sticky="w", padx=10, pady=10)
-        tb.Label(frame, text="(dejar vacío si no aplica)",
-                 font=("Segoe UI", 9, "italic"), foreground="gray").grid(
-            row=2, column=2, sticky="w")
+                 font=("Segoe UI", 11)).grid(row=2, column=1, sticky="w",
+                                             padx=10, pady=10)
+        tb.Label(frame, text="(dejar vac\u00edo si no aplica)",
+                 font=("Segoe UI", 9, "italic"),
+                 foreground="gray").grid(row=2, column=2, sticky="w")
 
         # Motivo
         tb.Label(frame, text="Motivo del defecto:", font=("Segoe UI", 11)).grid(
             row=3, column=0, sticky="e", padx=10, pady=10)
         self.motivo_var = StringVar()
         self.motivo_combo = tb.Combobox(frame, textvariable=self.motivo_var,
-                                        values=MOTIVOS, state="readonly", width=35,
-                                        font=("Segoe UI", 11))
+                                        values=MOTIVOS, state="readonly",
+                                        width=35, font=("Segoe UI", 11))
         self.motivo_combo.grid(row=3, column=1, sticky="w", padx=10, pady=10)
         self.motivo_combo.current(0)
 
         # Estado
         self.status_var = StringVar(value="Complete el formulario y presione REGISTRAR.")
         tb.Label(root, textvariable=self.status_var, font=("Segoe UI", 11),
-                 wraplength=620, justify="left", foreground="#555").pack(pady=14, padx=50)
+                 wraplength=620, justify="left",
+                 foreground="#555").pack(pady=14, padx=50)
 
         # Botones
         btn_frame = tb.Frame(root)
-        btn_frame.pack(pady=6)
+        btn_frame.pack(pady=10)
 
-        self.btn_reg = tb.Button(btn_frame, text="  REGISTRAR DEFECTO  ",
-                                 bootstyle=DANGER, width=26, command=self._on_registrar)
-        self.btn_reg.grid(row=0, column=0, padx=12)
+        self.btn = tb.Button(btn_frame, text="  REGISTRAR DEFECTO  ",
+                             bootstyle=DANGER, width=26,
+                             command=self._on_registrar)
+        self.btn.grid(row=0, column=0, padx=12)
 
-        tb.Button(btn_frame, text="  GENERAR REPORTE PDF  ",
-                  bootstyle=INFO, width=26,
+        tb.Button(btn_frame, text="  GENERAR REPORTE EXCEL  ",
+                  bootstyle=SUCCESS, width=26,
                   command=self._on_reporte).grid(row=0, column=1, padx=12)
 
     def _on_registrar(self):
@@ -469,10 +482,10 @@ class DefectosApp:
             pstr = self.prod_var.get()
             if not pstr:
                 raise ValueError("Seleccione un producto.")
-            id_producto = int(pstr.split(" — ")[0])
+            id_producto = int(pstr.split(" \u2014 ")[0])
             cant_str = self.cant_var.get().strip()
             if not cant_str or not cant_str.isdigit():
-                raise ValueError("La cantidad debe ser un número entero positivo.")
+                raise ValueError("La cantidad debe ser un n\u00famero entero positivo.")
             cantidad = int(cant_str)
             if cantidad <= 0:
                 raise ValueError("La cantidad debe ser mayor a cero.")
@@ -481,14 +494,14 @@ class DefectosApp:
             if not motivo:
                 raise ValueError("Seleccione un motivo.")
         except ValueError as exc:
-            self.status_var.set(f"⚠ {exc}")
+            self.status_var.set(f"\u26a0 {exc}")
             return
 
-        desc     = pstr.split(" — ", 1)[1] if " — " in pstr else pstr
+        desc     = pstr.split(" \u2014 ", 1)[1] if " \u2014 " in pstr else pstr
         lote_txt = lote if lote else "Sin especificar"
         if not messagebox.askyesno(
             "Confirmar registro",
-            f"¿Registrar el siguiente defecto?\n\n"
+            f"\u00bfRegistrar el siguiente defecto?\n\n"
             f"  Producto : {desc}\n"
             f"  Cantidad : {cantidad} botella(s)\n"
             f"  Lote     : {lote_txt}\n"
@@ -497,25 +510,27 @@ class DefectosApp:
         ):
             return
 
-        self.btn_reg.config(state="disabled", text="Guardando…")
+        self.btn.config(state="disabled", text="Guardando\u2026")
         self.root.update_idletasks()
         try:
             registrar_defecto(self.conn, id_producto, cantidad, lote, motivo)
             self.status_var.set(
-                f"✔ Defecto registrado.  Producto: {desc}  |  "
-                f"Cantidad: {cantidad}  |  Lote: {lote_txt}  |  Motivo: {motivo}"
+                f"\u2714 Defecto registrado. "
+                f"Producto: {desc}  |  Cantidad: {cantidad}  |  "
+                f"Lote: {lote_txt}  |  Motivo: {motivo}"
             )
             self.cant_var.set("1")
             self.lote_var.set("")
             self.motivo_combo.current(0)
         except Exception as exc:
             log.exception("Error al registrar defecto")
-            self.status_var.set(f"✘ Error: {exc}")
+            self.status_var.set(f"\u2718 Error: {exc}")
         finally:
-            self.btn_reg.config(state="normal", text="  REGISTRAR DEFECTO  ")
+            self.btn.config(state="normal", text="  REGISTRAR DEFECTO  ")
 
     def _on_reporte(self):
         ReporteWindow(self.root, self.conn)
+
 
 # ── ENTRYPOINT ────────────────────────────────────────────────────────────────
 def main():
@@ -523,7 +538,7 @@ def main():
         conn = pg_connect()
     except Exception as exc:
         messagebox.showerror("Error PostgreSQL", f"No se pudo conectar:\n{exc}")
-        log.critical("Fallo de conexión: %s", exc)
+        log.critical("Fallo de conexi\u00f3n: %s", exc)
         return
     DefectosApp(conn)
 

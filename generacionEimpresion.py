@@ -41,15 +41,17 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 
 DEFAULT_PG = {
-    "host": os.getenv("TALCA_PG_HOST", "localhost"),
-    "port": int(os.getenv("TALCA_PG_PORT", "5432")),
-    "dbname": os.getenv("TALCA_PG_DB", "postgres"),
-    "user": os.getenv("TALCA_PG_USER", "postgres"),
-    "password": os.getenv("TALCA_PG_PASS", ""),
-    "client_encoding": os.getenv("TALCA_PG_ENCODING", ""),  # ej: WIN1252
+    "host":"10.242.4.13",
+    "port": 5432,
+    "dbname": "stock",
+    "user": "postgres",
+    "password": "Talca2025",
+    "client_encoding": "WIN1252",
     "schema": "produccion",
     "table_products": "productos",
     "table_stock": "stock",
+    "table_bajas": "bajas",
+    "table_sheet": "sheet",
 }
 
 
@@ -298,12 +300,26 @@ def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: i
 
     c.save()
 
+    # ==========================================
+    #   APERTURA AUTOMÁTICA DEL PDF GENERADO
+    # ==========================================
+    try:
+        if sys.platform == "win32":
+            os.startfile(pdf_path)
+        elif sys.platform == "darwin":  # macOS
+            os.system(f'open "{pdf_path}"')
+        else:  # Linux y otros
+            os.system(f'xdg-open "{pdf_path}"')
+    except Exception as e:
+        print(f"No se pudo abrir el PDF automáticamente: {e}")
+    # ==========================================
+
     # guardamos en cache el último generado (por producto + lote actual)
     set_last_generated(id_producto, numero_lote, nro_serie)
 
     messagebox.showinfo(
         "PDF generado",
-        f"✅ PDF guardado:\n{pdf_path}\n\nLote: {numero_lote}\nÚltimo número de serie generado: {nro_serie}"
+        f"✅ PDF guardado y abierto:\n{pdf_path}\n\nLote: {numero_lote}\nÚltimo número de serie generado: {nro_serie}"
     )
 
 
