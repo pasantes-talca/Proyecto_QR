@@ -264,7 +264,10 @@ def qr_exists_in_stock(conn, id_producto: int, lote: str, nro_serie: int):
 
 
 # =======================
-#   STOCK NET (OPTIMIZADO - 1 sola query)
+#   STOCK NET (CORREGIDO)
+#   Un registro cuenta como PACKS si packs > 0,
+#   independientemente del valor de tipo_unidad.
+#   Un registro cuenta como PALLET puro solo si packs = 0.
 # =======================
 def compute_net_available_lote(conn, id_producto: int, lote: str):
     cfg    = get_pg_config()
@@ -273,9 +276,9 @@ def compute_net_available_lote(conn, id_producto: int, lote: str):
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT 
-                COUNT(CASE WHEN tipo_unidad = 'PALLET' THEN 1 END) AS pallets,
-                COALESCE(SUM(CASE WHEN tipo_unidad = 'PACKS' THEN packs ELSE 0 END), 0) AS packs
+            SELECT
+                COUNT(CASE WHEN COALESCE(packs, 0) = 0 THEN 1 END)            AS pallets,
+                COALESCE(SUM(CASE WHEN COALESCE(packs, 0) > 0 THEN packs END), 0) AS packs
             FROM {schema}.{tstock}
             WHERE id_producto = %s AND lote = %s;
         """, (int(id_producto), str(lote)))
@@ -291,10 +294,10 @@ def get_product_net_stock(conn, id_producto: int):
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT 
+            SELECT
                 p.descripcion,
-                COUNT(CASE WHEN s.tipo_unidad = 'PALLET' THEN 1 END) AS pallets,
-                COALESCE(SUM(CASE WHEN s.tipo_unidad = 'PACKS' THEN s.packs ELSE 0 END), 0) AS packs
+                COUNT(CASE WHEN COALESCE(s.packs, 0) = 0 THEN 1 END)                AS pallets,
+                COALESCE(SUM(CASE WHEN COALESCE(s.packs, 0) > 0 THEN s.packs END), 0) AS packs
             FROM {schema}.{tprod} p
             LEFT JOIN {schema}.{tstock} s ON s.id_producto = p.id
             WHERE p.id = %s
@@ -328,6 +331,7 @@ def delete_from_stock_manual(conn, id_producto: int, lote: str, tipo_unidad: str
 
     with conn.cursor() as cur:
         if tipo_unidad == "PALLET":
+            # Elimina registros donde packs = 0 (pallets puros)
             cur.execute(f"""
                 DELETE FROM {schema}.{tstock}
                 WHERE ctid IN (
@@ -335,17 +339,18 @@ def delete_from_stock_manual(conn, id_producto: int, lote: str, tipo_unidad: str
                     FROM   {schema}.{tstock}
                     WHERE  id_producto=%s
                       AND  lote=%s
-                      AND  tipo_unidad='PALLET'
+                      AND  COALESCE(packs, 0) = 0
                     ORDER BY nro_serie ASC
                     LIMIT %s
                 );
             """, (int(id_producto), str(lote), int(cantidad)))
 
         else:  # PACKS
+            # Selecciona registros donde packs > 0
             cur.execute(f"""
                 SELECT nro_serie, COALESCE(packs, 0)
                 FROM   {schema}.{tstock}
-                WHERE  id_producto=%s AND lote=%s AND tipo_unidad='PACKS'
+                WHERE  id_producto=%s AND lote=%s AND COALESCE(packs, 0) > 0
                 ORDER  BY nro_serie ASC;
             """, (int(id_producto), str(lote)))
             rows      = cur.fetchall()
@@ -442,7 +447,7 @@ def refresh_sheet_everywhere(conn, id_producto: int):
 
 
 # =======================
-#   BAJAS (lógica optimizada)
+#   BAJAS (lógica corregida)
 # =======================
 def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
     qr  = parse_qr_payload(raw_payload)
@@ -454,13 +459,15 @@ def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
     if not stock_info:
         raise ValueError("Ese QR NO existe en STOCK.")
 
-    tipo_unidad, packs = stock_info
-    if tipo_unidad == "PACKS":
-        cantidad = packs if packs > 0 else 1
+    tipo_unidad_db, packs = stock_info
+
+    # CORREGIDO: si el registro tiene packs > 0, es PACKS aunque tipo_unidad diga PALLET
+    if packs > 0:
+        cantidad    = packs
         tipo_unidad = "PACKS"
     else:
         tipo_unidad = "PALLET"
-        cantidad = 1
+        cantidad    = 1
 
     net_pallets_lote, net_packs_lote = compute_net_available_lote(conn, pid, lote)
     if tipo_unidad == "PALLET" and net_pallets_lote < 1:
@@ -505,7 +512,6 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 # =======================
 #   UI
 # =======================
-# ── Motivos disponibles (se usan en UI y en salida por QR) ─────────────────
 MOTIVOS = ("Venta", "Calidad", "Desarme", "Observacion")
 
 
@@ -581,6 +587,12 @@ def main():
     lote_combo = tb.Combobox(frame_manual, textvariable=lote_var, width=30, state="readonly")
     lote_combo.grid(row=1, column=1, sticky="w", padx=12, pady=8)
 
+    # ── Disponible del lote seleccionado ─────────────────────────────────────
+    lote_stock_var = tb.StringVar(value="")
+    tb.Label(frame_manual, textvariable=lote_stock_var,
+             font=("Segoe UI", 10), foreground="#555").grid(
+        row=1, column=2, columnspan=2, sticky="w", padx=12)
+
     tb.Label(frame_manual, text="Tipo:").grid(row=2, column=0, sticky="e", padx=12, pady=8)
     type_var = tb.StringVar(value="pallet")
     tb.Radiobutton(frame_manual, text="Pallets", variable=type_var,
@@ -623,22 +635,43 @@ def main():
     root.bind("<Configure>", update_wrap)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+    def refresh_lote_stock_label():
+        """Muestra pallets y packs disponibles para el lote seleccionado."""
+        val  = prod_var.get()
+        lote = lote_var.get().strip()
+        if not val or not lote:
+            lote_stock_var.set("")
+            return
+        try:
+            pid = int(val.split(" - ")[0])
+            p, pk = compute_net_available_lote(conn, pid, lote)
+            lote_stock_var.set(f"Disponible → Pallets: {p}  |  Packs: {pk}")
+        except Exception:
+            lote_stock_var.set("")
+
     def on_product_select(event=None):
         val = prod_var.get()
         if not val:
             lote_combo["values"] = []
             lote_var.set("")
+            lote_stock_var.set("")
             return
         try:
             pid   = int(val.split(" - ")[0])
             lotes = get_lotes_for_product(conn, pid)
             lote_combo["values"] = lotes
             lote_var.set(lotes[0] if lotes else "")
+            refresh_lote_stock_label()
         except Exception:
             lote_combo["values"] = []
             lote_var.set("")
+            lote_stock_var.set("")
+
+    def on_lote_select(event=None):
+        refresh_lote_stock_label()
 
     prod_combo.bind("<<ComboboxSelected>>", on_product_select)
+    lote_combo.bind("<<ComboboxSelected>>", on_lote_select)
 
     def refresh_product_combo():
         new_prods   = get_products_with_stock(conn)
@@ -676,6 +709,7 @@ def main():
                 f"Stock total restante → Pallets: {net_p} | Packs: {net_pk}"
             )
             refresh_product_combo()
+            refresh_lote_stock_label()
 
         except Exception as e:
             status_var.set(f"❌ ERROR al registrar baja por QR: {e}")
