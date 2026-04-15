@@ -205,7 +205,6 @@ def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int) -> dict
 #   DB HELPERS
 # =======================
 def get_product_desc(conn, id_producto: int) -> str:
-    # Ya no se usa (reemplazado por get_product_net_stock)
     cfg   = get_pg_config()
     schema = cfg["schema"]
     tprod  = cfg["table_products"]
@@ -268,7 +267,6 @@ def qr_exists_in_stock(conn, id_producto: int, lote: str, nro_serie: int):
 #   STOCK NET (OPTIMIZADO - 1 sola query)
 # =======================
 def compute_net_available_lote(conn, id_producto: int, lote: str):
-    """1 sola query para pallets + packs del lote"""
     cfg    = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -286,7 +284,6 @@ def compute_net_available_lote(conn, id_producto: int, lote: str):
 
 
 def get_product_net_stock(conn, id_producto: int):
-    """1 sola query: descripción + stock total del producto (pallets + packs)"""
     cfg    = get_pg_config()
     schema = cfg["schema"]
     tprod  = cfg["table_products"]
@@ -421,11 +418,9 @@ def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str
 #   REFRESH SHEET (DB rápido + Google en background)
 # =======================
 def refresh_sheet_everywhere(conn, id_producto: int):
-    """DB se actualiza al instante. Google Sheet va en segundo plano (no frena el escaneo)."""
     desc, net_pallets, net_packs = get_product_net_stock(conn, id_producto)
     upsert_sheet(conn, id_producto, net_pallets, net_packs)
 
-    # Google WebApp en segundo plano
     def _sync_google_background():
         warn = ""
         try:
@@ -443,7 +438,7 @@ def refresh_sheet_everywhere(conn, id_producto: int):
 
     threading.Thread(target=_sync_google_background, daemon=True).start()
 
-    return net_pallets, net_packs, desc, ""   # sin warning (el thread lo agrega después)
+    return net_pallets, net_packs, desc, ""
 
 
 # =======================
@@ -473,13 +468,8 @@ def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
     if tipo_unidad == "PACKS" and net_packs_lote < cantidad:
         raise ValueError("No hay PACKS disponibles para ese lote.")
 
-    # 1) Registrar en auditoría
     baja_id = registrar_baja(conn, pid, lote, cantidad, motivo, observaciones, tipo_unidad=tipo_unidad)
-
-    # 2) Eliminar físicamente de la tabla stock
     delete_from_stock_by_qr(conn, pid, lote, ns)
-
-    # 3) Actualizar totales (DB rápido + Google en background)
     net_pallets, net_packs, desc, _ = refresh_sheet_everywhere(conn, pid)
 
     return baja_id, pid, desc, lote, ns, tipo_unidad, cantidad, net_pallets, net_packs
@@ -505,13 +495,8 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
     if tipo_unidad == "PACKS" and net_packs_lote < cantidad:
         raise ValueError(f"No hay packs suficientes en ese lote. Disponibles: {net_packs_lote}")
 
-    # 1) Registrar en auditoría
     baja_id = registrar_baja(conn, pid, lote, cantidad, motivo, observaciones, tipo_unidad=tipo_unidad)
-
-    # 2) Eliminar físicamente de la tabla stock
     delete_from_stock_manual(conn, pid, lote, tipo_unidad, cantidad)
-
-    # 3) Actualizar totales (DB rápido + Google en background)
     net_pallets, net_packs, desc, _ = refresh_sheet_everywhere(conn, pid)
 
     return baja_id, pid, desc, lote, tipo_unidad, cantidad, net_pallets, net_packs
@@ -520,8 +505,12 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 # =======================
 #   UI
 # =======================
+# ── Motivos disponibles (se usan en UI y en salida por QR) ─────────────────
+MOTIVOS = ("Venta", "Calidad", "Desarme", "Observacion")
+
+
 def main():
-    global root, status_var   # para que el thread pueda actualizar el label
+    global root, status_var
 
     try:
         conn = pg_connect()
@@ -532,7 +521,7 @@ def main():
 
     root = tb.Window(themename="minty")
     root.title("Baja por QR / Manual – Talca (OPTIMIZADO)")
-    root.geometry("1100x720")
+    root.geometry("1100x760")
 
     container = tb.Frame(root)
     container.pack(expand=True)
@@ -545,7 +534,7 @@ def main():
     frame_motivo = tb.Frame(container)
     frame_motivo.pack(pady=8)
     tb.Label(frame_motivo, text="Motivo de baja:").pack(side="left", padx=10)
-    for m in ("Venta", "Calidad", "Desarme"):
+    for m in MOTIVOS:
         tb.Radiobutton(frame_motivo, text=m, variable=motivo_var, value=m).pack(side="left", padx=10)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -553,11 +542,21 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     tb.Label(container,
              text="Carga por QR – escaneá con pistola lectora (se envía automáticamente)",
-             font=("Segoe UI", 14)).pack(pady=(16, 8))
+             font=("Segoe UI", 14)).pack(pady=(16, 4))
+
+    # ── Observaciones para QR ─────────────────────────────────────────────────
+    frame_obs_qr = tb.Frame(container)
+    frame_obs_qr.pack(pady=(0, 4))
+    tb.Label(frame_obs_qr, text="Observación QR (opcional):",
+             font=("Segoe UI", 11)).pack(side="left", padx=8)
+    obs_qr_var   = tb.StringVar()
+    obs_qr_entry = tb.Entry(frame_obs_qr, textvariable=obs_qr_var,
+                            width=55, font=("Segoe UI", 11))
+    obs_qr_entry.pack(side="left", padx=4)
 
     qr_var   = tb.StringVar()
     qr_entry = tb.Entry(container, textvariable=qr_var, width=80, font=("Segoe UI", 14))
-    qr_entry.pack(pady=(0, 12))
+    qr_entry.pack(pady=(4, 12))
     qr_entry.focus_set()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -595,7 +594,7 @@ def main():
         row=3, column=1, sticky="w", padx=12)
 
     tb.Label(container,
-             text="Observaciones (opcional):",
+             text="Observaciones Manual (opcional):",
              font=("Segoe UI", 12)).pack(pady=4)
     obs_manual_var   = tb.StringVar()
     obs_manual_entry = tb.Entry(container, textvariable=obs_manual_var,
@@ -609,7 +608,7 @@ def main():
 
     # ── Estado ────────────────────────────────────────────────────────────────
     status_var   = tb.StringVar(
-        value="🟢 Listo – escaneá un QR (ahora mucho más rápido) o completá la carga manual.")
+        value="🟢 Listo – escaneá un QR o completá la carga manual.")
     status_label = tb.Label(container, textvariable=status_var,
                             font=("Segoe UI", 12), wraplength=900, justify="center")
     status_label.pack(pady=(0, 10), padx=40)
@@ -642,7 +641,6 @@ def main():
     prod_combo.bind("<<ComboboxSelected>>", on_product_select)
 
     def refresh_product_combo():
-        """Actualiza el combo de productos"""
         new_prods   = get_products_with_stock(conn)
         new_options = [f"{pid} - {desc}" for pid, desc in new_prods]
         prod_combo["values"] = new_options
@@ -663,15 +661,18 @@ def main():
 
         try:
             motivo = motivo_var.get()
+            obs    = obs_qr_var.get().strip() or None
+
             (baja_id, pid, desc, lote, ns,
              tipo_unidad, cantidad,
-             net_p, net_pk) = baja_por_qr(conn, raw, motivo, observaciones=None)
+             net_p, net_pk) = baja_por_qr(conn, raw, motivo, observaciones=obs)
 
+            obs_txt = obs if obs else "Ninguna"
             status_var.set(
-                f"✅ Baja por QR registrada automáticamente (MUY RÁPIDO!)\n"
+                f"✅ Baja por QR registrada automáticamente\n"
                 f"ID baja: {baja_id} | Producto: {pid} – {desc}\n"
                 f"Lote: {lote} | Serie: {ns} | {tipo_unidad}: {cantidad}\n"
-                f"Motivo: {motivo}\n"
+                f"Motivo: {motivo} | Observación: {obs_txt}\n"
                 f"Stock total restante → Pallets: {net_p} | Packs: {net_pk}"
             )
             refresh_product_combo()
@@ -712,11 +713,12 @@ def main():
              cantidad, net_p, net_pk) = baja_manual(
                 conn, pid, lote, tipo, qty, motivo, obs)
 
+            obs_txt = obs if obs else "Ninguna"
             status_var.set(
                 f"✅ Baja manual registrada\n"
                 f"ID baja: {baja_id} | Producto: {pid} – {desc}\n"
                 f"Lote: {lote} | {tipo_unidad}: {cantidad}\n"
-                f"Motivo: {motivo} | Obs: {obs if obs else 'Ninguna'}\n"
+                f"Motivo: {motivo} | Obs: {obs_txt}\n"
                 f"Stock total restante → Pallets: {net_p} | Packs: {net_pk}"
             )
 
