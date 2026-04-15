@@ -309,7 +309,7 @@ class ReingresoApp:
         tb.Label(root, text="Reingreso desde Bajas al Stock",
                  font=("Segoe UI", 22, "bold")).pack(pady=(20, 10))
 
-        frame = tb.LabelFrame(root, text="Datos del reingreso")
+        frame = tb.Labelframe(root, text="Datos del reingreso")
         frame.pack(pady=10, padx=50, fill="x")
 
         tb.Label(frame, text="Producto:").grid(row=0, column=0, sticky="e", padx=10, pady=10)

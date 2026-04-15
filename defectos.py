@@ -407,7 +407,7 @@ class DefectosApp:
         tb.Label(root, text="Registro de Defectos",
                  font=("Segoe UI", 22, "bold")).pack(pady=(24, 12))
 
-        frame = tb.LabelFrame(root, text="Datos del defecto")
+        frame = tb.Labelframe(root, text="Datos del defecto")
         frame.pack(pady=6, padx=50, fill="x", ipadx=10, ipady=10)
         frame.columnconfigure(1, weight=1)
 

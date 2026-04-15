@@ -38,7 +38,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 
 DEFAULT_PG = {
-    "host":"10.242.4.13",
+    "host": "10.242.4.13",
     "port": 5432,
     "dbname": "stock",
     "user": "postgres",
@@ -339,9 +339,7 @@ def get_product_desc(conn, id_producto: int) -> str:
 
 
 def qr_already_scanned(conn, id_producto: int, nro_serie: int, lote: str, descripcion_qr: str) -> bool:
-    """Solo verifica duplicados sobre el registro PALLET (el de entrada principal).
-    El registro PACKS del mismo nro_serie se inserta junto al PALLET en parciales
-    y no debe triggear falso positivo."""
+    """Solo verifica duplicados sobre el registro PALLET."""
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -385,6 +383,28 @@ def insert_one(conn, id_producto: int, nro_serie: int, lote: str, creacion_iso, 
             (int(id_producto), int(nro_serie), str(lote), creacion_iso, venc_iso, str(tipo_unidad), int(packs)),
         )
         return cur.rowcount == 1
+
+
+def get_last_registered_serial(conn, id_producto: int, lote: str):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT MAX(nro_serie)
+            FROM {schema}.{tstock}
+            WHERE id_producto = %s
+              AND lote = %s
+              AND tipo_unidad = 'PALLET';
+            """,
+            (int(id_producto), str(lote))
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
 
 
 def insert_missing_between(conn, id_producto: int, lote: str, a: int, b: int, creacion_iso, venc_iso):
@@ -493,24 +513,19 @@ def fetch_all_sheet_rows(conn):
 
 
 # =======================
-#   REFRESH SHEET (Google en segundo plano)
+#   REFRESH SHEET
 # =======================
 def refresh_sheet_background(conn, id_producto: int, on_warn=None):
-    """Actualiza solo la tabla sheet en Postgres.
-    El envío a Google Sheet lo maneja exclusivamente auto_sync_bulk_debounced
-    para evitar requests simultáneos que generan timeout."""
     net_pallets, net_packs = compute_net_stock(conn, id_producto)
     upsert_sheet(conn, id_producto, net_pallets, net_packs)
 
 
 # =======================
 #   AUTO BULK SYNC con DEBOUNCE
-#   Espera N segundos desde el último escaneo y recién entonces sincroniza.
-#   Si llega otro escaneo antes de que expire el timer, lo reinicia.
-#   Así nunca se solapan dos requests simultáneos al Sheet.
 # =======================
 _bulk_sync_timer = None
-_bulk_sync_lock  = threading.Lock()
+_bulk_sync_lock = threading.Lock()
+
 
 def auto_sync_bulk_debounced(conn, on_warn=None, delay_seconds: float = 4.0):
     global _bulk_sync_timer
@@ -518,7 +533,7 @@ def auto_sync_bulk_debounced(conn, on_warn=None, delay_seconds: float = 4.0):
     def _run():
         try:
             rows = fetch_all_sheet_rows(conn)
-            res  = send_bulk_to_sheet(rows)
+            res = send_bulk_to_sheet(rows)
             if not (isinstance(res, dict) and res.get("ok") is True):
                 if on_warn:
                     on_warn(f"⚠️ Auto-sync Sheet: respuesta inválida: {res}")
@@ -556,13 +571,13 @@ def main():
     entry_scan.pack(pady=12)
     entry_scan.focus_set()
 
-    # Toggle parcial
-    is_partial_var = tb.BooleanVar(value=False)
+    # Toggle completo
+    is_complete_var = tb.BooleanVar(value=False)
     toggle = tb.Checkbutton(
         root,
-        text="Pallet PARCIAL (cargar packs)",
-        variable=is_partial_var,
-        bootstyle="warning-round-toggle"
+        text="Activar si el pallet es completo",
+        variable=is_complete_var,
+        bootstyle="success-round-toggle"
     )
     toggle.pack(pady=6)
 
@@ -571,7 +586,7 @@ def main():
     packs_frame.pack(pady=6)
     tb.Label(
         packs_frame,
-        text="Cantidad de packs (Indicar solo si no es pallet completo):",
+        text="Cantidad de packs (indicar solo si el pallet es parcial):",
         font=("Segoe UI", 11)
     ).pack(side="left", padx=(0, 8))
 
@@ -588,7 +603,6 @@ def main():
         wraplength=940
     ).pack(pady=14)
 
-    # ---- BOTÓN ABAJO (sigue disponible para sync manual si se necesita) ----
     footer = tb.Frame(root)
     footer.pack(side=BOTTOM, fill=X, pady=(0, 14))
     tb.Button(
@@ -617,8 +631,6 @@ def main():
         except Exception as e:
             messagebox.showerror("Sync Google Sheet", f"❌ Error:\n{e}")
 
-    # cache en memoria: último nro_serie por (id_producto, lote)
-    last_seen = {}
     pending = {"data": None}
 
     def _on_sheet_warn(msg):
@@ -628,18 +640,19 @@ def main():
         root.after(0, _update)
 
     def set_packs_state():
-        if is_partial_var.get():
-            entry_packs.configure(state="normal")
-        else:
+        # Si está activado => pallet completo => NO pide packs
+        if is_complete_var.get():
             entry_packs.configure(state="disabled")
             packs_var.set("")
             pending["data"] = None
+        else:
+            # Desactivado => pallet parcial => SÍ pide packs
+            entry_packs.configure(state="normal")
+
 
     def reset_after_commit():
         scan_var.set("")
-        # ⚠️ NO limpiamos packs_var al resetear, para que el operador
-        # no tenga que volver a tipear la cantidad en escaneos parciales continuos.
-        # Si quiere cambiarla, la edita manualmente.
+        packs_var.set("")  # ← limpia la cantidad de packs después de enviar
         pending["data"] = None
         entry_scan.focus_set()
 
@@ -674,7 +687,8 @@ def main():
             reset_after_commit()
             return
 
-        # --- Insertar registro PALLET (siempre, incluso en parcial) ---
+        last_registered = get_last_registered_serial(conn, pid, lote)
+
         inserted = insert_one(
             conn,
             id_producto=pid,
@@ -696,7 +710,6 @@ def main():
             reset_after_commit()
             return
 
-        # --- Si es parcial, guardar los packs en el mismo registro PALLET ---
         if unit_type == "PACKS" and packs > 0:
             cfg = get_pg_config()
             with conn.cursor() as cur:
@@ -707,29 +720,39 @@ def main():
                     (int(packs), int(pid), int(serie), str(lote))
                 )
 
-        key = (pid, lote)
-        if key in last_seen:
-            prev = int(last_seen[key])
-            insert_missing_between(conn, pid, lote, prev, serie, cre, vto)
+        anchor = 0 if last_registered is None else int(last_registered)
 
-        last_seen[key] = serie
+        inserted_between = 0
+        skipped_between = 0
 
-        # Actualiza Postgres + envia fila individual al Sheet en background
+        if serie > anchor:
+            inserted_between, skipped_between = insert_missing_between(
+                conn, pid, lote, anchor, serie, cre, vto
+            )
+
         refresh_sheet_background(conn, pid, on_warn=_on_sheet_warn)
-
-        # Auto bulk-sync con debounce: espera 6s desde el ultimo escaneo
         auto_sync_bulk_debounced(conn, on_warn=_on_sheet_warn)
 
         root.bell()
         unit_label = f"PARCIAL ({packs} packs)" if unit_type == "PACKS" else "PALLET completo"
+
+        if last_registered is None:
+            autofill_msg = f"Autocompletado inicial: 1 a {serie}."
+        elif serie > last_registered:
+            autofill_msg = f"Autocompletado desde {last_registered} hasta {serie}."
+        else:
+            autofill_msg = f"Sin autocompletar (el último registrado era {last_registered})."
+
         status_var.set(
-            f"ENVIADO A BD [{unit_label}] - Sheet sincronizando...\n\n" +
+            f"ENVIADO A BD [{unit_label}] - Sheet sincronizando...\n"
+            f"{autofill_msg}\n"
+            f"Insertados intermedios: {inserted_between} | Ya existentes/saltados: {skipped_between}\n\n" +
             format_qr_detail(pid, serie, dsc_qr, lote, cre, vto)
         )
 
-        # --- Si era parcial, desactivar toggle automaticamente ---
-        if unit_type == "PACKS":
-            is_partial_var.set(False)   # dispara set_packs_state() -> limpia packs y deshabilita campo
+        # Si era completo, vuelve a dejar el sistema en modo parcial por defecto
+        if unit_type == "PALLET":
+            is_complete_var.set(False)
 
         reset_after_commit()
 
@@ -743,12 +766,12 @@ def main():
         try:
             data = parse_qr_payload(raw)
 
-            if not is_partial_var.get():
-                # Modo pallet completo: commit inmediato
+            # Si está activado => pallet completo => commit inmediato sin pedir packs
+            if is_complete_var.get():
                 commit_scan(data, unit_type="PALLET", packs=0)
                 return
 
-            # ✅ CAMBIO 1: Si ya hay un valor de packs cargado, commitear directo
+            # Si NO está activado => se asume parcial
             packs_raw = packs_var.get().strip()
             if packs_raw:
                 try:
@@ -757,9 +780,8 @@ def main():
                         commit_scan(data, unit_type="PACKS", packs=packs_val)
                         return
                 except ValueError:
-                    pass  # valor inválido → caer al flujo manual
+                    pass
 
-            # Si no hay packs cargados, pedir al operador
             pending["data"] = data
             pid = int(data["id_producto"])
             lote = str(data["lote"]).strip()
@@ -804,7 +826,7 @@ def main():
             pending["data"] = None
             entry_scan.focus_set()
 
-    is_partial_var.trace_add("write", lambda *_: set_packs_state())
+    is_complete_var.trace_add("write", lambda *_: set_packs_state())
 
     entry_scan.bind("<Return>", on_scan_enter)
     entry_packs.bind("<Return>", on_packs_enter)
