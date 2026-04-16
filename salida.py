@@ -191,10 +191,10 @@ def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
 def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int) -> dict:
     _, api_key = get_sheet_settings()
     payload = {
-        "api_key":      api_key,
-        "action":       "scan_pp",
-        "type":         "scan_pp",
-        "descripcion":  str(descripcion),
+        "api_key":       api_key,
+        "action":        "scan_pp",
+        "type":          "scan_pp",
+        "descripcion":   str(descripcion),
         "stock_pallets": int(pallets),
         "stock_packs":   int(packs),
     }
@@ -205,7 +205,7 @@ def send_update_row_to_sheet(descripcion: str, pallets: int, packs: int) -> dict
 #   DB HELPERS
 # =======================
 def get_product_desc(conn, id_producto: int) -> str:
-    cfg   = get_pg_config()
+    cfg    = get_pg_config()
     schema = cfg["schema"]
     tprod  = cfg["table_products"]
     with conn.cursor() as cur:
@@ -264,10 +264,7 @@ def qr_exists_in_stock(conn, id_producto: int, lote: str, nro_serie: int):
 
 
 # =======================
-#   STOCK NET (CORREGIDO)
-#   Un registro cuenta como PACKS si packs > 0,
-#   independientemente del valor de tipo_unidad.
-#   Un registro cuenta como PALLET puro solo si packs = 0.
+#   STOCK NET (OPTIMIZADO - 1 sola query)
 # =======================
 def compute_net_available_lote(conn, id_producto: int, lote: str):
     cfg    = get_pg_config()
@@ -276,9 +273,9 @@ def compute_net_available_lote(conn, id_producto: int, lote: str):
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT
-                COUNT(CASE WHEN COALESCE(packs, 0) = 0 THEN 1 END)            AS pallets,
-                COALESCE(SUM(CASE WHEN COALESCE(packs, 0) > 0 THEN packs END), 0) AS packs
+            SELECT 
+                COUNT(CASE WHEN tipo_unidad = 'PALLET' THEN 1 END) AS pallets,
+                COALESCE(SUM(CASE WHEN tipo_unidad = 'PACKS' THEN packs ELSE 0 END), 0) AS packs
             FROM {schema}.{tstock}
             WHERE id_producto = %s AND lote = %s;
         """, (int(id_producto), str(lote)))
@@ -294,10 +291,10 @@ def get_product_net_stock(conn, id_producto: int):
 
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT
+            SELECT 
                 p.descripcion,
-                COUNT(CASE WHEN COALESCE(s.packs, 0) = 0 THEN 1 END)                AS pallets,
-                COALESCE(SUM(CASE WHEN COALESCE(s.packs, 0) > 0 THEN s.packs END), 0) AS packs
+                COUNT(CASE WHEN s.tipo_unidad = 'PALLET' THEN 1 END) AS pallets,
+                COALESCE(SUM(CASE WHEN s.tipo_unidad = 'PACKS' THEN s.packs ELSE 0 END), 0) AS packs
             FROM {schema}.{tprod} p
             LEFT JOIN {schema}.{tstock} s ON s.id_producto = p.id
             WHERE p.id = %s
@@ -310,69 +307,92 @@ def get_product_net_stock(conn, id_producto: int):
 
 
 # =======================
-#   ELIMINAR DE STOCK
+#   ELIMINAR DE STOCK (ITERATIVO)
 # =======================
-def delete_from_stock_by_qr(conn, id_producto: int, lote: str, nro_serie: int):
+def delete_from_stock_iterative(conn, id_producto: int, lote: str, tipo_unidad: str, cantidad: int):
+    """
+    Elimina de stock con la MISMA lógica iterativa de la baja manual.
+    Devuelve un detalle de series afectadas para mostrar en la UI.
+    """
     cfg    = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
 
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            DELETE FROM {schema}.{tstock}
-            WHERE id_producto=%s AND lote=%s AND nro_serie=%s;
-        """, (int(id_producto), str(lote), int(nro_serie)))
-
-
-def delete_from_stock_manual(conn, id_producto: int, lote: str, tipo_unidad: str, cantidad: int):
-    cfg    = get_pg_config()
-    schema = cfg["schema"]
-    tstock = cfg["table_stock"]
+    tipo_unidad = str(tipo_unidad).upper().strip()
+    cantidad    = int(cantidad)
+    afectadas   = []
 
     with conn.cursor() as cur:
         if tipo_unidad == "PALLET":
-            # Elimina registros donde packs = 0 (pallets puros)
             cur.execute(f"""
-                DELETE FROM {schema}.{tstock}
-                WHERE ctid IN (
-                    SELECT ctid
-                    FROM   {schema}.{tstock}
-                    WHERE  id_producto=%s
-                      AND  lote=%s
-                      AND  COALESCE(packs, 0) = 0
-                    ORDER BY nro_serie ASC
-                    LIMIT %s
-                );
+                SELECT ctid::text, nro_serie
+                FROM {schema}.{tstock}
+                WHERE id_producto=%s
+                  AND lote=%s
+                  AND tipo_unidad='PALLET'
+                ORDER BY nro_serie ASC
+                LIMIT %s;
             """, (int(id_producto), str(lote), int(cantidad)))
+            rows = cur.fetchall()
 
-        else:  # PACKS
-            # Selecciona registros donde packs > 0
+            if len(rows) < cantidad:
+                raise ValueError(f"No hay pallets suficientes en ese lote. Disponibles: {len(rows)}")
+
+            for ctid_txt, nro_serie in rows:
+                cur.execute(f"""
+                    DELETE FROM {schema}.{tstock}
+                    WHERE ctid = %s::tid;
+                """, (ctid_txt,))
+                afectadas.append(str(nro_serie))
+
+        elif tipo_unidad == "PACKS":
             cur.execute(f"""
-                SELECT nro_serie, COALESCE(packs, 0)
-                FROM   {schema}.{tstock}
-                WHERE  id_producto=%s AND lote=%s AND COALESCE(packs, 0) > 0
-                ORDER  BY nro_serie ASC;
+                SELECT ctid::text, nro_serie, COALESCE(packs, 0)
+                FROM {schema}.{tstock}
+                WHERE id_producto=%s
+                  AND lote=%s
+                  AND tipo_unidad='PACKS'
+                ORDER BY nro_serie ASC;
             """, (int(id_producto), str(lote)))
-            rows      = cur.fetchall()
-            remaining = int(cantidad)
+            rows = cur.fetchall()
 
-            for ns, packs_val in rows:
+            remaining = int(cantidad)
+            disponibles = sum(int(r[2] or 0) for r in rows)
+
+            if disponibles < remaining:
+                raise ValueError(f"No hay packs suficientes en ese lote. Disponibles: {disponibles}")
+
+            for ctid_txt, nro_serie, packs_val in rows:
                 if remaining <= 0:
                     break
+
                 packs_val = int(packs_val or 0)
+                if packs_val <= 0:
+                    continue
+
                 if packs_val <= remaining:
                     cur.execute(f"""
                         DELETE FROM {schema}.{tstock}
-                        WHERE id_producto=%s AND lote=%s AND nro_serie=%s;
-                    """, (int(id_producto), str(lote), ns))
+                        WHERE ctid = %s::tid;
+                    """, (ctid_txt,))
                     remaining -= packs_val
+                    afectadas.append(f"{nro_serie} (-{packs_val} packs)")
                 else:
                     cur.execute(f"""
                         UPDATE {schema}.{tstock}
-                        SET    packs = packs - %s
-                        WHERE  id_producto=%s AND lote=%s AND nro_serie=%s;
-                    """, (remaining, int(id_producto), str(lote), ns))
+                        SET packs = packs - %s
+                        WHERE ctid = %s::tid;
+                    """, (remaining, ctid_txt))
+                    afectadas.append(f"{nro_serie} (-{remaining} packs)")
                     remaining = 0
+
+            if remaining > 0:
+                raise ValueError("No se pudo completar la baja iterativa de packs.")
+
+        else:
+            raise ValueError("Tipo de unidad inválido para eliminación iterativa.")
+
+    return afectadas
 
 
 # =======================
@@ -447,27 +467,34 @@ def refresh_sheet_everywhere(conn, id_producto: int):
 
 
 # =======================
-#   BAJAS (lógica corregida)
+#   BAJAS
 # =======================
 def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
-    qr  = parse_qr_payload(raw_payload)
-    pid = int(qr["id_producto"])
+    """
+    Ahora la baja por QR usa el QR SOLO como referencia para identificar:
+    - producto
+    - lote
+    - tipo_unidad / cantidad
+
+    Pero NO elimina la serie escaneada.
+    El descuento en stock se hace con la misma lógica iterativa de la baja manual.
+    """
+    qr   = parse_qr_payload(raw_payload)
+    pid  = int(qr["id_producto"])
     lote = str(qr["lote"])
-    ns   = int(qr["nro_serie"])
+    ns   = int(qr["nro_serie"])   # solo referencia escaneada
 
     stock_info = qr_exists_in_stock(conn, pid, lote, ns)
     if not stock_info:
         raise ValueError("Ese QR NO existe en STOCK.")
 
-    tipo_unidad_db, packs = stock_info
-
-    # CORREGIDO: si el registro tiene packs > 0, es PACKS aunque tipo_unidad diga PALLET
-    if packs > 0:
-        cantidad    = packs
+    tipo_detectado, packs = stock_info
+    if tipo_detectado == "PACKS":
         tipo_unidad = "PACKS"
+        cantidad = packs if packs > 0 else 1
     else:
         tipo_unidad = "PALLET"
-        cantidad    = 1
+        cantidad = 1
 
     net_pallets_lote, net_packs_lote = compute_net_available_lote(conn, pid, lote)
     if tipo_unidad == "PALLET" and net_pallets_lote < 1:
@@ -476,10 +503,20 @@ def baja_por_qr(conn, raw_payload: str, motivo: str, observaciones: str = None):
         raise ValueError("No hay PACKS disponibles para ese lote.")
 
     baja_id = registrar_baja(conn, pid, lote, cantidad, motivo, observaciones, tipo_unidad=tipo_unidad)
-    delete_from_stock_by_qr(conn, pid, lote, ns)
+
+    # CAMBIO CLAVE:
+    # ya NO se borra la serie escaneada exacta;
+    # se aplica la misma baja iterativa que la manual.
+    series_afectadas = delete_from_stock_iterative(conn, pid, lote, tipo_unidad, cantidad)
+
     net_pallets, net_packs, desc, _ = refresh_sheet_everywhere(conn, pid)
 
-    return baja_id, pid, desc, lote, ns, tipo_unidad, cantidad, net_pallets, net_packs
+    return (
+        baja_id, pid, desc, lote, ns,
+        tipo_unidad, cantidad,
+        net_pallets, net_packs,
+        series_afectadas
+    )
 
 
 def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
@@ -503,7 +540,7 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
         raise ValueError(f"No hay packs suficientes en ese lote. Disponibles: {net_packs_lote}")
 
     baja_id = registrar_baja(conn, pid, lote, cantidad, motivo, observaciones, tipo_unidad=tipo_unidad)
-    delete_from_stock_manual(conn, pid, lote, tipo_unidad, cantidad)
+    delete_from_stock_iterative(conn, pid, lote, tipo_unidad, cantidad)
     net_pallets, net_packs, desc, _ = refresh_sheet_everywhere(conn, pid)
 
     return baja_id, pid, desc, lote, tipo_unidad, cantidad, net_pallets, net_packs
@@ -544,13 +581,12 @@ def main():
         tb.Radiobutton(frame_motivo, text=m, variable=motivo_var, value=m).pack(side="left", padx=10)
 
     # ══════════════════════════════════════════════════════════════════════════
-    #   SECCIÓN QR  (envío automático, sin botón)
+    #   SECCIÓN QR
     # ══════════════════════════════════════════════════════════════════════════
     tb.Label(container,
              text="Carga por QR – escaneá con pistola lectora (se envía automáticamente)",
              font=("Segoe UI", 14)).pack(pady=(16, 4))
 
-    # ── Observaciones para QR ─────────────────────────────────────────────────
     frame_obs_qr = tb.Frame(container)
     frame_obs_qr.pack(pady=(0, 4))
     tb.Label(frame_obs_qr, text="Observación QR (opcional):",
@@ -566,7 +602,7 @@ def main():
     qr_entry.focus_set()
 
     # ══════════════════════════════════════════════════════════════════════════
-    #   SECCIÓN MANUAL  (envío con botón ENVIAR)
+    #   SECCIÓN MANUAL
     # ══════════════════════════════════════════════════════════════════════════
     tb.Label(container, text="Carga Manual",
              font=("Segoe UI", 14)).pack(pady=(8, 10))
@@ -586,12 +622,6 @@ def main():
     lote_var   = tb.StringVar()
     lote_combo = tb.Combobox(frame_manual, textvariable=lote_var, width=30, state="readonly")
     lote_combo.grid(row=1, column=1, sticky="w", padx=12, pady=8)
-
-    # ── Disponible del lote seleccionado ─────────────────────────────────────
-    lote_stock_var = tb.StringVar(value="")
-    tb.Label(frame_manual, textvariable=lote_stock_var,
-             font=("Segoe UI", 10), foreground="#555").grid(
-        row=1, column=2, columnspan=2, sticky="w", padx=12)
 
     tb.Label(frame_manual, text="Tipo:").grid(row=2, column=0, sticky="e", padx=12, pady=8)
     type_var = tb.StringVar(value="pallet")
@@ -613,12 +643,10 @@ def main():
                                 width=90, font=("Segoe UI", 12))
     obs_manual_entry.pack(pady=(0, 12))
 
-    # ── Botón ENVIAR  (solo manual) ───────────────────────────────────────────
     btn_send = tb.Button(container, text="ENVIAR BAJA MANUAL",
                          bootstyle=WARNING, width=28)
     btn_send.pack(pady=(6, 12))
 
-    # ── Estado ────────────────────────────────────────────────────────────────
     status_var   = tb.StringVar(
         value="🟢 Listo – escaneá un QR o completá la carga manual.")
     status_label = tb.Label(container, textvariable=status_var,
@@ -634,51 +662,28 @@ def main():
 
     root.bind("<Configure>", update_wrap)
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    def refresh_lote_stock_label():
-        """Muestra pallets y packs disponibles para el lote seleccionado."""
-        val  = prod_var.get()
-        lote = lote_var.get().strip()
-        if not val or not lote:
-            lote_stock_var.set("")
-            return
-        try:
-            pid = int(val.split(" - ")[0])
-            p, pk = compute_net_available_lote(conn, pid, lote)
-            lote_stock_var.set(f"Disponible → Pallets: {p}  |  Packs: {pk}")
-        except Exception:
-            lote_stock_var.set("")
-
     def on_product_select(event=None):
         val = prod_var.get()
         if not val:
             lote_combo["values"] = []
             lote_var.set("")
-            lote_stock_var.set("")
             return
         try:
             pid   = int(val.split(" - ")[0])
             lotes = get_lotes_for_product(conn, pid)
             lote_combo["values"] = lotes
             lote_var.set(lotes[0] if lotes else "")
-            refresh_lote_stock_label()
         except Exception:
             lote_combo["values"] = []
             lote_var.set("")
-            lote_stock_var.set("")
-
-    def on_lote_select(event=None):
-        refresh_lote_stock_label()
 
     prod_combo.bind("<<ComboboxSelected>>", on_product_select)
-    lote_combo.bind("<<ComboboxSelected>>", on_lote_select)
 
     def refresh_product_combo():
         new_prods   = get_products_with_stock(conn)
         new_options = [f"{pid} - {desc}" for pid, desc in new_prods]
         prod_combo["values"] = new_options
 
-    # ── Envío por QR  (AUTOMÁTICO al escanear) ────────────────────────────────
     def on_qr_scan(event=None):
         raw = qr_var.get().strip()
         if not raw:
@@ -696,20 +701,31 @@ def main():
             motivo = motivo_var.get()
             obs    = obs_qr_var.get().strip() or None
 
-            (baja_id, pid, desc, lote, ns,
-             tipo_unidad, cantidad,
-             net_p, net_pk) = baja_por_qr(conn, raw, motivo, observaciones=obs)
+            (
+                baja_id, pid, desc, lote, ns,
+                tipo_unidad, cantidad,
+                net_p, net_pk,
+                series_afectadas
+            ) = baja_por_qr(conn, raw, motivo, observaciones=obs)
 
             obs_txt = obs if obs else "Ninguna"
+            if series_afectadas:
+                detalle_series = ", ".join(series_afectadas[:12])
+                if len(series_afectadas) > 12:
+                    detalle_series += ", ..."
+            else:
+                detalle_series = "Sin detalle"
+
             status_var.set(
                 f"✅ Baja por QR registrada automáticamente\n"
                 f"ID baja: {baja_id} | Producto: {pid} – {desc}\n"
-                f"Lote: {lote} | Serie: {ns} | {tipo_unidad}: {cantidad}\n"
+                f"Lote: {lote} | Serie escaneada de referencia: {ns}\n"
+                f"Baja aplicada en modo iterativo → {tipo_unidad}: {cantidad}\n"
+                f"Series afectadas: {detalle_series}\n"
                 f"Motivo: {motivo} | Observación: {obs_txt}\n"
                 f"Stock total restante → Pallets: {net_p} | Packs: {net_pk}"
             )
             refresh_product_combo()
-            refresh_lote_stock_label()
 
         except Exception as e:
             status_var.set(f"❌ ERROR al registrar baja por QR: {e}")
@@ -720,7 +736,6 @@ def main():
 
     qr_entry.bind("<Return>", on_qr_scan)
 
-    # ── Envío manual  (botón ENVIAR) ──────────────────────────────────────────
     def submit_manual():
         try:
             pstr = prod_var.get()
@@ -768,7 +783,6 @@ def main():
     btn_send.configure(command=submit_manual)
     obs_manual_entry.bind("<Return>", lambda e: submit_manual())
 
-    # Init combos
     if options:
         prod_var.set(options[0])
         on_product_select()
