@@ -39,9 +39,8 @@ def get_app_dir():
 APP_DIR = get_app_dir()
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
-
 DEFAULT_PG = {
-    "host":"10.242.4.13",
+    "host": "10.242.4.13",
     "port": 5432,
     "dbname": "stock",
     "user": "postgres",
@@ -88,15 +87,46 @@ def get_pg_config():
     return cfg
 
 
-def cache_get(key: str, default=None):
+# =======================
+#   CACHÉ LOCAL (por producto)
+# =======================
+def cache_key_for_product(id_producto: int) -> str:
+    """Clave única de caché por producto (sin lote)."""
+    return f"last_serie::{id_producto}"
+
+
+def cache_get_serie(id_producto: int) -> int:
+    """Devuelve el último N° de serie generado para este producto (0 si nunca se generó)."""
     data = load_config()
     cache = data.get("cache", {})
-    if isinstance(cache, dict) and key in cache:
-        return cache.get(key, default)
-    return default
+    key = cache_key_for_product(id_producto)
+    try:
+        return int(cache.get(key, 0))
+    except Exception:
+        return 0
 
 
-def cache_set(key: str, value):
+def cache_set_serie(id_producto: int, ultimo: int):
+    """Guarda el último N° de serie generado para este producto."""
+    data = load_config()
+    if not isinstance(data.get("cache"), dict):
+        data["cache"] = {}
+    data["cache"][cache_key_for_product(id_producto)] = int(ultimo)
+    save_config(data)
+
+
+def cache_reset_serie(id_producto: int):
+    """Resetea a 0 el N° de serie del producto (próxima impresión arrancará desde 1)."""
+    cache_set_serie(id_producto, 0)
+
+
+def cache_get_ui(key: str, default=None):
+    """Caché genérica para guardar estado de la UI (último producto seleccionado, etc.)."""
+    data = load_config()
+    return data.get("cache", {}).get(key, default)
+
+
+def cache_set_ui(key: str, value):
     data = load_config()
     if not isinstance(data.get("cache"), dict):
         data["cache"] = {}
@@ -129,10 +159,6 @@ def pg_connect():
 
 
 def fetch_products(conn):
-    """
-    ✅ NUEVA BD:
-      produccion.productos(id, descripcion)
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     prod = cfg["table_products"]
@@ -146,53 +172,6 @@ def fetch_products(conn):
         return cur.fetchall()  # [(id, descripcion), ...]
 
 
-def get_db_max_serie_for_producto(conn, id_producto: int) -> int:
-    """
-    ✅ NUEVO:
-    Busca el máximo nro_serie ya ingresado en produccion.stock para ESE PRODUCTO,
-    sin importar el lote.
-
-    Esto hace que si se generaron QR de más (sobrantes) en un lote anterior y
-    NO se escanearon, la próxima producción (nuevo lote) continúe desde el último
-    nro_serie REALMENTE INGRESADO en stock.
-    """
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tstock = cfg["table_stock"]
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT COALESCE(MAX(nro_serie), 0)
-            FROM {schema}.{tstock}
-            WHERE id_producto = %s;
-        """, (int(id_producto),))
-        return int(cur.fetchone()[0] or 0)
-
-
-def get_starting_serie(conn, id_producto: int, lote: str) -> int:
-    """
-    ✅ AJUSTE NUEVO (lo que me pediste):
-
-    - Base REAL: max(nro_serie) en DB para ese PRODUCTO (cualquier lote)
-    - Plus seguridad local: cache de "último generado" SOLO para (producto + lote actual)
-      para evitar duplicar números si en el mismo día/lote se aprieta "Generar" más de una vez
-      antes de escanear.
-
-    Arranca desde el mayor de ambos.
-    """
-    db_max = get_db_max_serie_for_producto(conn, id_producto)
-
-    cache_key = f"gen_ultimo_serie::{id_producto}::{lote}"
-    cache_max = int(cache_get(cache_key, 0) or 0)
-
-    return max(db_max, cache_max)
-
-
-def set_last_generated(id_producto: int, lote: str, ultimo: int):
-    cache_key = f"gen_ultimo_serie::{id_producto}::{lote}"
-    cache_set(cache_key, int(ultimo))
-
-
 # =======================
 #   PDF / QR
 # =======================
@@ -200,20 +179,23 @@ def dividir_texto(texto, max_caracteres):
     return textwrap.wrap(str(texto), width=max_caracteres)
 
 
-def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: int):
+def generar_y_imprimir_qrs(id_producto: int, descripcion: str, cantidad: int, on_done_callback=None):
+    """
+    Genera el PDF con los QR codes.
+    La serie SIEMPRE arranca desde la caché local del producto (0 si nunca se imprimió
+    o fue reseteada → primer QR impreso tendrá N° de serie: 1).
+    NO consulta la base de datos para el número de serie.
+    """
     fecha_actual = datetime.now()
-
-    # Lote = ddmmyy (igual que antes)
     numero_lote = fecha_actual.strftime("%d%m%y")
-
     fec_iso = fecha_actual.strftime("%Y-%m-%d")
     vto_iso = (fecha_actual + relativedelta(months=6)).strftime("%Y-%m-%d")
-
     fecha_str = fecha_actual.strftime("%d/%m/%y")
     fecha_venc_str = (fecha_actual + relativedelta(months=6)).strftime("%d/%m/%y")
 
-    # ✅ Serie inicial (DB por PRODUCTO vs cache por LOTE actual)
-    nro_serie = get_starting_serie(conn, id_producto, numero_lote)
+    # ── Serie: sólo caché local ──────────────────────────────────────────────
+    nro_serie = cache_get_serie(id_producto)
+    # Si la caché es 0 (nuevo producto o reseteado), el primer QR será el 1.
 
     pdf_path = filedialog.asksaveasfilename(
         defaultextension=".pdf",
@@ -300,27 +282,30 @@ def generar_y_imprimir_qrs(conn, id_producto: int, descripcion: str, cantidad: i
 
     c.save()
 
-    # ==========================================
-    #   APERTURA AUTOMÁTICA DEL PDF GENERADO
-    # ==========================================
+    # ── Guardar último número generado en caché local ────────────────────────
+    cache_set_serie(id_producto, nro_serie)
+
+    # ── Abrir el PDF automáticamente ─────────────────────────────────────────
     try:
         if sys.platform == "win32":
             os.startfile(pdf_path)
-        elif sys.platform == "darwin":  # macOS
+        elif sys.platform == "darwin":
             os.system(f'open "{pdf_path}"')
-        else:  # Linux y otros
+        else:
             os.system(f'xdg-open "{pdf_path}"')
     except Exception as e:
         print(f"No se pudo abrir el PDF automáticamente: {e}")
-    # ==========================================
-
-    # guardamos en cache el último generado (por producto + lote actual)
-    set_last_generated(id_producto, numero_lote, nro_serie)
 
     messagebox.showinfo(
         "PDF generado",
-        f"✅ PDF guardado y abierto:\n{pdf_path}\n\nLote: {numero_lote}\nÚltimo número de serie generado: {nro_serie}"
+        f"✅ PDF guardado y abierto:\n{pdf_path}\n\n"
+        f"Lote: {numero_lote}\n"
+        f"Último número de serie generado: {nro_serie}"
     )
+
+    # Notificar a la UI para que actualice el label de caché
+    if on_done_callback:
+        on_done_callback(nro_serie)
 
 
 # =======================
@@ -341,34 +326,98 @@ def main():
 
     root = tb.Window(themename="minty")
     root.title("Generación e Impresión de QRs – Talca (PostgreSQL)")
-    root.geometry("920x540")
+    root.geometry("960x580")
 
-    tb.Label(root, text="Generador de QRs", font=("Segoe UI", 20, "bold")).pack(pady=18)
-    tb.Label(root, text="Seleccioná un producto:", font=("Segoe UI", 12)).pack(pady=6)
+    # ── Título ────────────────────────────────────────────────────────────────
+    tb.Label(
+        root,
+        text="Generador de QRs",
+        font=("Segoe UI", 20, "bold")
+    ).pack(pady=18)
 
-    producto_dict = {f"{desc} (ID: {pid})": (int(pid), str(desc)) for pid, desc in productos}
+    # ── Combo de productos ────────────────────────────────────────────────────
+    tb.Label(root, text="Seleccioná un producto:", font=("Segoe UI", 12)).pack(pady=4)
 
-    combo = tb.Combobox(root, values=list(producto_dict.keys()), width=92)
+    producto_dict = {
+        f"{desc} (ID: {pid})": (int(pid), str(desc))
+        for pid, desc in productos
+    }
+
+    combo = tb.Combobox(root, values=list(producto_dict.keys()), width=92, state="readonly")
     combo.pack(pady=4)
 
-    tb.Label(root, text="Cantidad de números de serie:", font=("Segoe UI", 12)).pack(pady=12)
-    cantidad_entry = tb.Entry(root, width=12)
+    # ── Panel de caché ────────────────────────────────────────────────────────
+    frame_cache = tb.Labelframe(
+        root,
+        text="Estado de caché (último N° de serie impreso)",
+        padding=12,
+        bootstyle="info"
+    )
+    frame_cache.pack(fill="x", padx=40, pady=10)
+
+    cache_label = tb.Label(
+        frame_cache,
+        text="— Seleccioná un producto para ver el estado —",
+        font=("Segoe UI", 12),
+        bootstyle="info"
+    )
+    cache_label.pack(side="left", padx=10)
+
+    def actualizar_label_cache(pid: int | None = None):
+        """Refresca el label que muestra el último N° de serie en caché."""
+        if pid is None:
+            cache_label.config(
+                text="— Seleccioná un producto para ver el estado —",
+                bootstyle="info"
+            )
+            return
+        ultimo = cache_get_serie(pid)
+        if ultimo == 0:
+            cache_label.config(
+                text="Sin impresiones previas → arrancará desde N° de serie: 1",
+                bootstyle="success"
+            )
+        else:
+            cache_label.config(
+                text=f"Último N° de serie impreso: {ultimo}  →  el próximo será: {ultimo + 1}",
+                bootstyle="warning"
+            )
+
+    def on_combo_change(event=None):
+        sel = combo.get()
+        if sel in producto_dict:
+            pid, _ = producto_dict[sel]
+            actualizar_label_cache(pid)
+        else:
+            actualizar_label_cache(None)
+
+    combo.bind("<<ComboboxSelected>>", on_combo_change)
+
+    # ── Cantidad ──────────────────────────────────────────────────────────────
+    tb.Label(root, text="Cantidad de números de serie:", font=("Segoe UI", 12)).pack(pady=10)
+    cantidad_entry = tb.Entry(root, width=12, font=("Segoe UI", 13))
     cantidad_entry.pack()
 
-    # restaurar UI
-    last_prod = cache_get("ui_gen_producto", "")
-    last_cant = cache_get("ui_gen_cantidad", "")
+    # ── Restaurar estado de UI ────────────────────────────────────────────────
+    last_prod = cache_get_ui("ui_gen_producto", "")
+    last_cant = cache_get_ui("ui_gen_cantidad", "")
 
     if last_prod in producto_dict:
         combo.set(last_prod)
+        on_combo_change()
     if last_cant:
         try:
             cantidad_entry.insert(0, str(int(last_cant)))
         except Exception:
             pass
 
+    # ── Botones ───────────────────────────────────────────────────────────────
+    frame_btns = tb.Frame(root)
+    frame_btns.pack(pady=22)
+
     def al_hacer_click_generar():
-        if not combo.get():
+        sel = combo.get()
+        if not sel or sel not in producto_dict:
             messagebox.showwarning("Aviso", "Seleccioná un producto.")
             return
 
@@ -377,17 +426,71 @@ def main():
             if cantidad <= 0:
                 raise ValueError
         except Exception:
-            messagebox.showwarning("Aviso", "Cantidad inválida.")
+            messagebox.showwarning("Aviso", "Ingresá una cantidad válida (número entero mayor a 0).")
             return
 
-        pid, desc = producto_dict[combo.get()]
-        generar_y_imprimir_qrs(conn_pg, pid, desc, cantidad)
+        pid, desc = producto_dict[sel]
 
-        cache_set("ui_gen_producto", combo.get())
-        cache_set("ui_gen_cantidad", cantidad)
+        def on_done(ultimo_serie: int):
+            actualizar_label_cache(pid)
 
-    tb.Button(root, text="GENERAR", bootstyle=SUCCESS, command=al_hacer_click_generar).pack(pady=22)
+        generar_y_imprimir_qrs(pid, desc, cantidad, on_done_callback=on_done)
 
+        cache_set_ui("ui_gen_producto", sel)
+        cache_set_ui("ui_gen_cantidad", cantidad)
+
+    def al_hacer_click_resetear():
+        sel = combo.get()
+        if not sel or sel not in producto_dict:
+            messagebox.showwarning("Aviso", "Seleccioná un producto para resetear.")
+            return
+
+        pid, desc = producto_dict[sel]
+        ultimo = cache_get_serie(pid)
+
+        if ultimo == 0:
+            messagebox.showinfo(
+                "Sin cambios",
+                f"El producto ya está en 0.\nLa próxima impresión arrancará desde N° de serie: 1."
+            )
+            return
+
+        confirmar = messagebox.askyesno(
+            "⚠️  ¿Estás seguro?",
+            f"Vas a resetear el numero de serie del producto:\n\n"
+            f"  {desc}\n\n"
+            f"Último N° de serie registrado: {ultimo}\n\n"
+            f"Si confirmás, la próxima impresión arrancará desde N° de serie: 1.\n\n"
+            f"¿Querés continuar?",
+            icon="warning"
+        )
+
+        if confirmar:
+            cache_reset_serie(pid)
+            actualizar_label_cache(pid)
+            messagebox.showinfo(
+                "Numero de serie reseteada",
+                f"✅ El numero de serie de '{desc}' fue reseteada.\n"
+                f"La próxima impresión arrancará desde N° de serie: 1."
+            )
+
+    tb.Button(
+        frame_btns,
+        text="  GENERAR QRs  ",
+        bootstyle=SUCCESS,
+        width=20,
+        command=al_hacer_click_generar
+    ).grid(row=0, column=0, padx=16)
+
+    tb.Button(
+        frame_btns,
+        text=" INICIAR NUEVA LINEA DE PRODUCCION ",
+        bootstyle=DANGER,
+        width=40,
+        command=al_hacer_click_resetear
+    ).grid(row=0, column=1, padx=16)
+
+    # ── Cierre limpio ─────────────────────────────────────────────────────────
     def on_close():
         try:
             conn_pg.close()
