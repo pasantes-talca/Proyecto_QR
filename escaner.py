@@ -35,7 +35,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 DEFAULT_PG = {
     "host": "10.242.4.13",
     "port": 5432,
-    "dbname": "stock_copia",
+    "dbname": "stock",
     "user": "postgres",
     "password": "Talca2025",
     "client_encoding": "WIN1252",

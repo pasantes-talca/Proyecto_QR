@@ -6,10 +6,13 @@ import urllib.error
 import threading
 import tkinter as tk
 import unicodedata
+import smtplib
+from datetime import datetime
+from email.message import EmailMessage
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
-from tkinter import messagebox, ttk, simpledialog
+from tkinter import messagebox, ttk
 
 try:
     import psycopg2
@@ -24,6 +27,8 @@ root = None
 status_text = None
 
 PASSWORD_ADMIN = "Talca2026**"
+EMAIL_AJUSTES_TO = "psantes@talca.com.ar"
+LOTE_AJUSTE_DEFAULT = "AJUSTE"
 
 
 def set_status(text: str):
@@ -148,6 +153,36 @@ def get_sheet_settings():
     return url, api_key
 
 
+def get_email_settings():
+    """
+    Para que el mail salga realmente, agregá esto en config.json:
+
+    {
+      "email": {
+        "smtp_host": "smtp.office365.com",
+        "smtp_port": 587,
+        "smtp_user": "usuario@talca.com",
+        "smtp_password": "CLAVE_DEL_CORREO",
+        "from": "usuario@talca.com",
+        "to": "psantes@talca.com",
+        "use_tls": true
+      }
+    }
+    """
+    data = load_config()
+    email = data.get("email") if isinstance(data.get("email"), dict) else {}
+
+    return {
+        "smtp_host": email.get("smtp_host") or email.get("host"),
+        "smtp_port": int(email.get("smtp_port") or email.get("port") or 587),
+        "smtp_user": email.get("smtp_user") or email.get("user"),
+        "smtp_password": email.get("smtp_password") or email.get("password"),
+        "from": email.get("from") or email.get("from_addr") or email.get("smtp_user") or email.get("user"),
+        "to": email.get("to") or EMAIL_AJUSTES_TO,
+        "use_tls": bool(email.get("use_tls", True)),
+    }
+
+
 # =======================
 #   CLIENTES HELPERS
 # =======================
@@ -216,6 +251,7 @@ def ensure_cliente_exists(conn, nombre_cliente: str):
             VALUES (%s, %s, TRUE, NOW())
             RETURNING id, nombre;
         """, (nombre, nombre_normalizado))
+
         new_row = cur.fetchone()
         return int(new_row[0]), str(new_row[1]).strip(), True
 
@@ -374,17 +410,20 @@ def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
                 return json.loads(txt)
             except Exception:
                 return {"ok": False, "raw": txt}
+
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
+
         return {
             "ok": False,
             "http_status": getattr(e, "code", None),
             "error": str(e),
             "raw": body,
         }
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -431,6 +470,86 @@ def _sync_google_stock_async(id_producto: int, desc: str, net_pallets: int, net_
 
 
 # =======================
+#   EMAIL
+# =======================
+def build_stock_changes_email_body(cambios: list[dict]) -> str:
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    lines = [
+        "Se realizaron ajustes de stock desde el sistema de bajas de Talca.",
+        "",
+        f"Fecha y hora: {now}",
+        f"Cantidad de productos modificados: {len(cambios)}",
+        "",
+        "Detalle de cambios:",
+        "",
+    ]
+
+    for c in cambios:
+        lines.append(f"Producto: [{c['id_producto']}] {c['descripcion']}")
+        lines.append(f"Stock anterior: {c['pallets_antes']} pallets / {c['packs_antes']} packs")
+        lines.append(f"Stock nuevo: {c['pallets_despues']} pallets / {c['packs_despues']} packs")
+        lines.append(f"Diferencia: {format_diff(c['diff_pallets'], c['diff_packs'])}")
+
+        bajas_ids = c.get("bajas_ids") or []
+        if bajas_ids:
+            lines.append(f"Bajas registradas: {', '.join(str(x) for x in bajas_ids)}")
+        else:
+            lines.append("Bajas registradas: No corresponde")
+
+        lines.append("-" * 60)
+
+    return "\n".join(lines)
+
+
+def send_stock_changes_email(cambios: list[dict]):
+    settings = get_email_settings()
+
+    host = settings["smtp_host"]
+    port = settings["smtp_port"]
+    user = settings["smtp_user"]
+    password = settings["smtp_password"]
+    from_addr = settings["from"]
+    to_addr = settings["to"]
+    use_tls = settings["use_tls"]
+
+    if not host or not user or not password or not from_addr or not to_addr:
+        raise ValueError(
+            "Falta configurar el email en config.json. "
+            "Necesitás smtp_host, smtp_user, smtp_password, from y to."
+        )
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Ajustes de stock Talca - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg.set_content(build_stock_changes_email_body(cambios))
+
+    with smtplib.SMTP(host, port, timeout=30) as smtp:
+        if use_tls:
+            smtp.starttls()
+        smtp.login(user, password)
+        smtp.send_message(msg)
+
+
+def send_stock_changes_email_async(cambios: list[dict]):
+    def _worker():
+        try:
+            send_stock_changes_email(cambios)
+            msg = f"📧 Mail enviado correctamente a {EMAIL_AJUSTES_TO}."
+        except Exception as e:
+            msg = f"⚠️ No se pudo enviar el mail de ajustes: {e}"
+
+        if root is not None:
+            try:
+                root.after(0, lambda: append_status(msg))
+            except Exception:
+                pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# =======================
 #   DB HELPERS
 # =======================
 def get_products_with_stock(conn):
@@ -458,43 +577,6 @@ def get_products_with_stock(conn):
             ORDER BY p.id ASC;
         """)
         return cur.fetchall()
-
-
-def get_all_products(conn):
-    """Devuelve todos los productos (incluso sin stock) para el editor."""
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tprod = cfg["table_products"]
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT id, descripcion
-            FROM {schema}.{tprod}
-            ORDER BY id ASC;
-        """)
-        return cur.fetchall()
-
-
-def get_lotes_for_product(conn, id_producto: int):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tstock = cfg["table_stock"]
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT DISTINCT lote
-            FROM {schema}.{tstock}
-            WHERE id_producto = %s
-              AND (
-                    UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
-                    OR (
-                        UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
-                        AND COALESCE(packs, 0) > 0
-                    )
-              )
-            ORDER BY lote ASC;
-        """, (int(id_producto),))
-        return [r[0] for r in cur.fetchall()]
 
 
 def get_stock_summary_by_product(conn):
@@ -553,14 +635,11 @@ def get_stock_summary_by_product(conn):
         pallets = int(row[2] or 0)
         packs = int(row[3] or 0)
         result.append((pid, desc, pallets, packs))
+
     return result
 
 
 def get_stock_summary_all_products(conn):
-    """
-    Devuelve todos los productos con su stock actual (incluyendo los que tienen 0).
-    Usado por el editor de stock administrativo.
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tprod = cfg["table_products"]
@@ -600,7 +679,30 @@ def get_stock_summary_all_products(conn):
         pallets = int(row[2] or 0)
         packs = int(row[3] or 0)
         result.append((pid, desc, pallets, packs))
+
     return result
+
+
+def get_lotes_for_product(conn, id_producto: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT DISTINCT lote
+            FROM {schema}.{tstock}
+            WHERE id_producto = %s
+              AND (
+                    UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
+                    OR (
+                        UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
+                        AND COALESCE(packs, 0) > 0
+                    )
+              )
+            ORDER BY lote ASC;
+        """, (int(id_producto),))
+        return [r[0] for r in cur.fetchall()]
 
 
 def compute_net_available_lote(conn, id_producto: int, lote: str):
@@ -662,213 +764,15 @@ def get_product_net_stock(conn, id_producto: int):
             WHERE p.id = %s
             GROUP BY p.descripcion;
         """, (int(id_producto),))
+
         row = cur.fetchone()
+
         if row and row[0]:
             return str(row[0]).strip(), int(row[1] or 0), int(row[2] or 0)
+
         return "Sin descripción", 0, 0
 
 
-# =======================
-#   AJUSTE DIRECTO DE STOCK (ADMIN)
-# =======================
-def set_stock_directo(conn, id_producto: int, nuevo_pallets: int, nuevo_packs: int):
-    """
-    Ajusta el stock de un producto a los valores absolutos indicados.
-
-    Estrategia:
-      - Obtiene el lote más reciente del producto (o usa 'AJUSTE' si no hay ninguno).
-      - Elimina TODOS los registros de stock existentes para ese producto.
-      - Si nuevo_pallets > 0: inserta N filas tipo PALLET con nro_serie sintético.
-      - Si nuevo_packs > 0: inserta 1 fila tipo PACKS con el valor indicado.
-      - Actualiza la tabla sheet.
-      - Retorna (descripcion, nuevo_pallets, nuevo_packs).
-    """
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tstock = cfg["table_stock"]
-    tprod = cfg["table_products"]
-    tsheet = cfg["table_sheet"]
-
-    pid = int(id_producto)
-    nuevo_pallets = int(nuevo_pallets)
-    nuevo_packs = int(nuevo_packs)
-
-    if nuevo_pallets < 0 or nuevo_packs < 0:
-        raise ValueError("Los valores de stock no pueden ser negativos.")
-
-    prev_autocommit = conn.autocommit
-
-    try:
-        conn.autocommit = False
-
-        with conn.cursor() as cur:
-            # Descripción del producto
-            cur.execute(f"SELECT descripcion FROM {schema}.{tprod} WHERE id = %s;", (pid,))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError(f"No existe el producto con id={pid}.")
-            desc = str(row[0]).strip() if row[0] else "Sin descripción"
-
-            # Obtener lote representativo (el más frecuente o cualquiera)
-            cur.execute(f"""
-                SELECT lote
-                FROM {schema}.{tstock}
-                WHERE id_producto = %s
-                ORDER BY id DESC
-                LIMIT 1;
-            """, (pid,))
-            lote_row = cur.fetchone()
-            lote = str(lote_row[0]).strip() if lote_row else "AJUSTE"
-
-            # Obtener nro_serie máximo actual para no pisar
-            cur.execute(f"""
-                SELECT COALESCE(MAX(nro_serie), 0)
-                FROM {schema}.{tstock}
-                WHERE id_producto = %s;
-            """, (pid,))
-            max_serie_row = cur.fetchone()
-            base_serie = int(max_serie_row[0] or 0) + 1
-
-            # Borrar TODO el stock del producto
-            cur.execute(f"""
-                DELETE FROM {schema}.{tstock}
-                WHERE id_producto = %s;
-            """, (pid,))
-
-            # Insertar filas de PALLET (una por pallet)
-            for i in range(nuevo_pallets):
-                cur.execute(f"""
-                    INSERT INTO {schema}.{tstock}
-                        (id_producto, lote, tipo_unidad, nro_serie, packs)
-                    VALUES (%s, %s, 'PALLET', %s, NULL);
-                """, (pid, lote, base_serie + i))
-
-            # Insertar fila de PACKS si hay
-            if nuevo_packs > 0:
-                serie_packs = base_serie + nuevo_pallets
-                cur.execute(f"""
-                    INSERT INTO {schema}.{tstock}
-                        (id_producto, lote, tipo_unidad, nro_serie, packs)
-                    VALUES (%s, %s, 'PACKS', %s, %s);
-                """, (pid, lote, serie_packs, nuevo_packs))
-
-            # Actualizar tabla sheet
-            cur.execute(f"""
-                INSERT INTO {schema}.{tsheet}(id_producto, stock_pallets, stock_packs)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (id_producto)
-                DO UPDATE SET stock_pallets = EXCLUDED.stock_pallets,
-                              stock_packs   = EXCLUDED.stock_packs;
-            """, (pid, nuevo_pallets, nuevo_packs))
-
-        conn.commit()
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        conn.autocommit = prev_autocommit
-
-    return desc, nuevo_pallets, nuevo_packs
-
-
-# =======================
-#   ELIMINAR DE STOCK
-# =======================
-def delete_from_stock_iterative(conn, id_producto: int, lote: str, tipo_unidad: str, cantidad: int):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tstock = cfg["table_stock"]
-
-    tipo_unidad = str(tipo_unidad).upper().strip()
-    cantidad = int(cantidad)
-    afectadas = []
-
-    with conn.cursor() as cur:
-        if tipo_unidad == "PALLET":
-            cur.execute(f"""
-                SELECT ctid::text, nro_serie
-                FROM {schema}.{tstock}
-                WHERE id_producto = %s
-                  AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s)
-                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
-                ORDER BY nro_serie ASC
-                LIMIT %s
-                FOR UPDATE;
-            """, (int(id_producto), str(lote), int(cantidad)))
-            rows = cur.fetchall()
-
-            if len(rows) < cantidad:
-                raise ValueError(f"No hay pallets suficientes en ese lote. Disponibles: {len(rows)}")
-
-            for ctid_txt, nro_serie in rows:
-                cur.execute(f"""
-                    DELETE FROM {schema}.{tstock}
-                    WHERE ctid = %s::tid;
-                """, (ctid_txt,))
-                if cur.rowcount != 1:
-                    raise ValueError(f"No se pudo eliminar correctamente el pallet serie {nro_serie}.")
-                afectadas.append(str(nro_serie))
-
-        elif tipo_unidad == "PACKS":
-            cur.execute(f"""
-                SELECT ctid::text, nro_serie, COALESCE(packs, 0)
-                FROM {schema}.{tstock}
-                WHERE id_producto = %s
-                  AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s)
-                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
-                  AND COALESCE(packs, 0) > 0
-                ORDER BY nro_serie ASC
-                FOR UPDATE;
-            """, (int(id_producto), str(lote)))
-            rows = cur.fetchall()
-
-            remaining = int(cantidad)
-            disponibles = sum(int(r[2] or 0) for r in rows)
-
-            if disponibles < remaining:
-                raise ValueError(f"No hay packs suficientes en ese lote. Disponibles: {disponibles}")
-
-            for ctid_txt, nro_serie, packs_val in rows:
-                if remaining <= 0:
-                    break
-
-                packs_val = int(packs_val or 0)
-                if packs_val <= 0:
-                    continue
-
-                if packs_val <= remaining:
-                    cur.execute(f"""
-                        DELETE FROM {schema}.{tstock}
-                        WHERE ctid = %s::tid;
-                    """, (ctid_txt,))
-                    if cur.rowcount != 1:
-                        raise ValueError(f"No se pudo eliminar correctamente el registro packs serie {nro_serie}.")
-                    remaining -= packs_val
-                    afectadas.append(f"{nro_serie} (-{packs_val} packs)")
-                else:
-                    cur.execute(f"""
-                        UPDATE {schema}.{tstock}
-                        SET packs = packs - %s
-                        WHERE ctid = %s::tid;
-                    """, (remaining, ctid_txt))
-                    if cur.rowcount != 1:
-                        raise ValueError(f"No se pudo actualizar correctamente el registro packs serie {nro_serie}.")
-                    afectadas.append(f"{nro_serie} (-{remaining} packs)")
-                    remaining = 0
-
-            if remaining > 0:
-                raise ValueError("No se pudo completar la baja iterativa de packs.")
-        else:
-            raise ValueError("Tipo de unidad inválido para eliminación iterativa.")
-
-    return afectadas
-
-
-# =======================
-#   SHEET / UPSERT
-# =======================
 def upsert_sheet(conn, id_producto: int, stock_pallets: int, stock_packs: int):
     cfg = get_pg_config()
     schema = cfg["schema"]
@@ -910,7 +814,438 @@ def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str
             (cliente.strip() if cliente else None),
             (int(id_cliente) if id_cliente is not None else None),
         ))
+
         return cur.fetchone()[0]
+
+
+# =======================
+#   STOCK LOW LEVEL
+# =======================
+def get_next_nro_serie(conn, id_producto: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COALESCE(MAX(nro_serie), 0)
+            FROM {schema}.{tstock}
+            WHERE id_producto = %s;
+        """, (int(id_producto),))
+        row = cur.fetchone()
+
+    return int(row[0] or 0) + 1
+
+
+def get_lote_para_alta(conn, id_producto: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT lote
+            FROM {schema}.{tstock}
+            WHERE id_producto = %s
+            ORDER BY nro_serie DESC NULLS LAST
+            LIMIT 1;
+        """, (int(id_producto),))
+        row = cur.fetchone()
+
+    if row and row[0]:
+        return str(row[0]).strip()
+
+    return LOTE_AJUSTE_DEFAULT
+
+
+def insert_stock_adjustment_records(conn, id_producto: int, lote: str,
+                                    tipo_unidad: str, cantidad: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    pid = int(id_producto)
+    cantidad = int(cantidad)
+    tipo_unidad = str(tipo_unidad).upper().strip()
+    lote = str(lote or LOTE_AJUSTE_DEFAULT).strip() or LOTE_AJUSTE_DEFAULT
+
+    if cantidad <= 0:
+        return []
+
+    inserted = []
+    next_serie = get_next_nro_serie(conn, pid)
+
+    with conn.cursor() as cur:
+        if tipo_unidad == "PALLET":
+            for i in range(cantidad):
+                nro_serie = next_serie + i
+                cur.execute(f"""
+                    INSERT INTO {schema}.{tstock}
+                        (id_producto, lote, tipo_unidad, nro_serie, packs)
+                    VALUES (%s, %s, 'PALLET', %s, NULL);
+                """, (pid, lote, nro_serie))
+                inserted.append(str(nro_serie))
+
+        elif tipo_unidad == "PACKS":
+            cur.execute(f"""
+                INSERT INTO {schema}.{tstock}
+                    (id_producto, lote, tipo_unidad, nro_serie, packs)
+                VALUES (%s, %s, 'PACKS', %s, %s);
+            """, (pid, lote, next_serie, cantidad))
+            inserted.append(f"{next_serie} (+{cantidad} packs)")
+
+        else:
+            raise ValueError("Tipo de unidad inválido para alta de ajuste.")
+
+    return inserted
+
+
+def delete_from_stock_iterative(conn, id_producto: int, lote: str, tipo_unidad: str, cantidad: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    tipo_unidad = str(tipo_unidad).upper().strip()
+    cantidad = int(cantidad)
+    afectadas = []
+
+    with conn.cursor() as cur:
+        if tipo_unidad == "PALLET":
+            cur.execute(f"""
+                SELECT ctid::text, nro_serie
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                  AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s)
+                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
+                ORDER BY nro_serie ASC
+                LIMIT %s
+                FOR UPDATE;
+            """, (int(id_producto), str(lote), int(cantidad)))
+
+            rows = cur.fetchall()
+
+            if len(rows) < cantidad:
+                raise ValueError(f"No hay pallets suficientes en ese lote. Disponibles: {len(rows)}")
+
+            for ctid_txt, nro_serie in rows:
+                cur.execute(f"""
+                    DELETE FROM {schema}.{tstock}
+                    WHERE ctid = %s::tid;
+                """, (ctid_txt,))
+
+                if cur.rowcount != 1:
+                    raise ValueError(f"No se pudo eliminar correctamente el pallet serie {nro_serie}.")
+
+                afectadas.append(str(nro_serie))
+
+        elif tipo_unidad == "PACKS":
+            cur.execute(f"""
+                SELECT ctid::text, nro_serie, COALESCE(packs, 0)
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                  AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s)
+                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
+                  AND COALESCE(packs, 0) > 0
+                ORDER BY nro_serie ASC
+                FOR UPDATE;
+            """, (int(id_producto), str(lote)))
+
+            rows = cur.fetchall()
+            remaining = int(cantidad)
+            disponibles = sum(int(r[2] or 0) for r in rows)
+
+            if disponibles < remaining:
+                raise ValueError(f"No hay packs suficientes en ese lote. Disponibles: {disponibles}")
+
+            for ctid_txt, nro_serie, packs_val in rows:
+                if remaining <= 0:
+                    break
+
+                packs_val = int(packs_val or 0)
+                if packs_val <= 0:
+                    continue
+
+                if packs_val <= remaining:
+                    cur.execute(f"""
+                        DELETE FROM {schema}.{tstock}
+                        WHERE ctid = %s::tid;
+                    """, (ctid_txt,))
+
+                    if cur.rowcount != 1:
+                        raise ValueError(f"No se pudo eliminar correctamente el registro packs serie {nro_serie}.")
+
+                    remaining -= packs_val
+                    afectadas.append(f"{nro_serie} (-{packs_val} packs)")
+
+                else:
+                    cur.execute(f"""
+                        UPDATE {schema}.{tstock}
+                        SET packs = packs - %s
+                        WHERE ctid = %s::tid;
+                    """, (remaining, ctid_txt))
+
+                    if cur.rowcount != 1:
+                        raise ValueError(f"No se pudo actualizar correctamente el registro packs serie {nro_serie}.")
+
+                    afectadas.append(f"{nro_serie} (-{remaining} packs)")
+                    remaining = 0
+
+            if remaining > 0:
+                raise ValueError("No se pudo completar la baja iterativa de packs.")
+
+        else:
+            raise ValueError("Tipo de unidad inválido para eliminación iterativa.")
+
+    return afectadas
+
+
+def delete_from_stock_general_iterative(conn, id_producto: int, tipo_unidad: str, cantidad: int):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    tipo_unidad = str(tipo_unidad).upper().strip()
+    cantidad = int(cantidad)
+    afectadas = []
+    bajas_por_lote = {}
+
+    def add_lote_qty(lote_value, qty):
+        lote_txt = str(lote_value or "SIN LOTE").strip() or "SIN LOTE"
+        bajas_por_lote[lote_txt] = bajas_por_lote.get(lote_txt, 0) + int(qty)
+
+    with conn.cursor() as cur:
+        if tipo_unidad == "PALLET":
+            cur.execute(f"""
+                SELECT ctid::text, nro_serie, COALESCE(lote::text, 'SIN LOTE')
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
+                ORDER BY lote ASC, nro_serie ASC
+                LIMIT %s
+                FOR UPDATE;
+            """, (int(id_producto), int(cantidad)))
+
+            rows = cur.fetchall()
+
+            if len(rows) < cantidad:
+                raise ValueError(f"No hay pallets suficientes para ajustar. Disponibles: {len(rows)}")
+
+            for ctid_txt, nro_serie, lote_val in rows:
+                cur.execute(f"""
+                    DELETE FROM {schema}.{tstock}
+                    WHERE ctid = %s::tid;
+                """, (ctid_txt,))
+
+                if cur.rowcount != 1:
+                    raise ValueError(f"No se pudo eliminar correctamente el pallet serie {nro_serie}.")
+
+                afectadas.append(str(nro_serie))
+                add_lote_qty(lote_val, 1)
+
+        elif tipo_unidad == "PACKS":
+            cur.execute(f"""
+                SELECT ctid::text, nro_serie, COALESCE(lote::text, 'SIN LOTE'), COALESCE(packs, 0)
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
+                  AND COALESCE(packs, 0) > 0
+                ORDER BY lote ASC, nro_serie ASC
+                FOR UPDATE;
+            """, (int(id_producto),))
+
+            rows = cur.fetchall()
+            remaining = int(cantidad)
+            disponibles = sum(int(r[3] or 0) for r in rows)
+
+            if disponibles < remaining:
+                raise ValueError(f"No hay packs suficientes para ajustar. Disponibles: {disponibles}")
+
+            for ctid_txt, nro_serie, lote_val, packs_val in rows:
+                if remaining <= 0:
+                    break
+
+                packs_val = int(packs_val or 0)
+                if packs_val <= 0:
+                    continue
+
+                if packs_val <= remaining:
+                    cur.execute(f"""
+                        DELETE FROM {schema}.{tstock}
+                        WHERE ctid = %s::tid;
+                    """, (ctid_txt,))
+
+                    if cur.rowcount != 1:
+                        raise ValueError(f"No se pudo eliminar correctamente el registro packs serie {nro_serie}.")
+
+                    remaining -= packs_val
+                    afectadas.append(f"{nro_serie} (-{packs_val} packs)")
+                    add_lote_qty(lote_val, packs_val)
+
+                else:
+                    cur.execute(f"""
+                        UPDATE {schema}.{tstock}
+                        SET packs = packs - %s
+                        WHERE ctid = %s::tid;
+                    """, (remaining, ctid_txt))
+
+                    if cur.rowcount != 1:
+                        raise ValueError(f"No se pudo actualizar correctamente el registro packs serie {nro_serie}.")
+
+                    afectadas.append(f"{nro_serie} (-{remaining} packs)")
+                    add_lote_qty(lote_val, remaining)
+                    remaining = 0
+
+            if remaining > 0:
+                raise ValueError("No se pudo completar el ajuste iterativo de packs.")
+
+        else:
+            raise ValueError("Tipo de unidad inválido para ajuste.")
+
+    return afectadas, bajas_por_lote
+
+
+# =======================
+#   AJUSTE EN LOTE
+# =======================
+def format_diff(diff_pallets: int, diff_packs: int) -> str:
+    parts = []
+
+    if diff_pallets > 0:
+        parts.append(f"Pallets +{diff_pallets}")
+    elif diff_pallets < 0:
+        parts.append(f"Pallets {diff_pallets}")
+
+    if diff_packs > 0:
+        parts.append(f"Packs +{diff_packs}")
+    elif diff_packs < 0:
+        parts.append(f"Packs {diff_packs}")
+
+    return " | ".join(parts) if parts else "Sin cambios"
+
+
+def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
+    pid = int(cambio["id_producto"])
+    nuevo_pallets = int(cambio["nuevo_pallets"])
+    nuevo_packs = int(cambio["nuevo_packs"])
+
+    if nuevo_pallets < 0 or nuevo_packs < 0:
+        raise ValueError(f"El producto {pid} tiene valores negativos.")
+
+    desc, pallets_antes, packs_antes = get_product_net_stock(conn, pid)
+
+    diff_pallets = nuevo_pallets - pallets_antes
+    diff_packs = nuevo_packs - packs_antes
+
+    bajas_ids = []
+
+    if diff_pallets == 0 and diff_packs == 0:
+        return {
+            "id_producto": pid,
+            "descripcion": desc,
+            "pallets_antes": pallets_antes,
+            "packs_antes": packs_antes,
+            "pallets_despues": pallets_antes,
+            "packs_despues": packs_antes,
+            "diff_pallets": 0,
+            "diff_packs": 0,
+            "bajas_ids": [],
+            "sin_cambios": True,
+        }
+
+    lote_alta = get_lote_para_alta(conn, pid)
+
+    if diff_pallets > 0:
+        insert_stock_adjustment_records(conn, pid, lote_alta, "PALLET", diff_pallets)
+
+    elif diff_pallets < 0:
+        _, bajas_por_lote = delete_from_stock_general_iterative(
+            conn,
+            pid,
+            "PALLET",
+            abs(diff_pallets)
+        )
+
+        for lote, qty in bajas_por_lote.items():
+            baja_id = registrar_baja(
+                conn,
+                pid,
+                lote,
+                qty,
+                "Ajuste de stock",
+                f"Ajuste administrativo. Stock anterior: {pallets_antes} pallets. Stock nuevo: {nuevo_pallets} pallets.",
+                tipo_unidad="PALLET"
+            )
+            bajas_ids.append(baja_id)
+
+    if diff_packs > 0:
+        insert_stock_adjustment_records(conn, pid, lote_alta, "PACKS", diff_packs)
+
+    elif diff_packs < 0:
+        _, bajas_por_lote = delete_from_stock_general_iterative(
+            conn,
+            pid,
+            "PACKS",
+            abs(diff_packs)
+        )
+
+        for lote, qty in bajas_por_lote.items():
+            baja_id = registrar_baja(
+                conn,
+                pid,
+                lote,
+                qty,
+                "Ajuste de stock",
+                f"Ajuste administrativo. Stock anterior: {packs_antes} packs. Stock nuevo: {nuevo_packs} packs.",
+                tipo_unidad="PACKS"
+            )
+            bajas_ids.append(baja_id)
+
+    desc_final, pallets_despues, packs_despues = get_product_net_stock(conn, pid)
+    upsert_sheet(conn, pid, pallets_despues, packs_despues)
+
+    return {
+        "id_producto": pid,
+        "descripcion": desc_final,
+        "pallets_antes": pallets_antes,
+        "packs_antes": packs_antes,
+        "pallets_despues": pallets_despues,
+        "packs_despues": packs_despues,
+        "diff_pallets": pallets_despues - pallets_antes,
+        "diff_packs": packs_despues - packs_antes,
+        "bajas_ids": bajas_ids,
+        "sin_cambios": False,
+    }
+
+
+def set_stock_lote(conn, cambios: list[dict]) -> list[dict]:
+    """
+    Aplica todos los ajustes juntos.
+    Si uno falla, se hace rollback completo.
+    """
+    if not cambios:
+        return []
+
+    prev_autocommit = conn.autocommit
+    resultados = []
+
+    try:
+        conn.autocommit = False
+
+        for cambio in cambios:
+            res = aplicar_ajuste_producto_en_transaccion(conn, cambio)
+            if not res.get("sin_cambios"):
+                resultados.append(res)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.autocommit = prev_autocommit
+
+    return resultados
 
 
 # =======================
@@ -926,6 +1261,7 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 
     if tipo not in ("pallet", "packs"):
         raise ValueError("Tipo inválido (pallet / packs).")
+
     if cantidad <= 0:
         raise ValueError("Cantidad debe ser > 0.")
 
@@ -1000,17 +1336,12 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 #   DIALOGO CONTRASEÑA
 # =======================
 def pedir_contrasena(parent) -> bool:
-    """
-    Muestra un diálogo modal pidiendo contraseña.
-    Retorna True si la contraseña es correcta, False si cancela o falla.
-    """
     dialog = tk.Toplevel(parent)
     dialog.title("Acceso restringido")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.focus_set()
 
-    # Centrar sobre la ventana padre
     parent.update_idletasks()
     px = parent.winfo_x() + parent.winfo_width() // 2
     py = parent.winfo_y() + parent.winfo_height() // 2
@@ -1056,8 +1387,21 @@ def pedir_contrasena(parent) -> bool:
     btn_frame = tb.Frame(frame)
     btn_frame.pack(pady=(10, 0))
 
-    tb.Button(btn_frame, text="Ingresar", bootstyle=SUCCESS, width=12, command=confirmar).pack(side="left", padx=6)
-    tb.Button(btn_frame, text="Cancelar", bootstyle=SECONDARY, width=12, command=cancelar).pack(side="left", padx=6)
+    tb.Button(
+        btn_frame,
+        text="Ingresar",
+        bootstyle=SUCCESS,
+        width=12,
+        command=confirmar
+    ).pack(side="left", padx=6)
+
+    tb.Button(
+        btn_frame,
+        text="Cancelar",
+        bootstyle=SECONDARY,
+        width=12,
+        command=cancelar
+    ).pack(side="left", padx=6)
 
     pwd_entry.bind("<Return>", confirmar)
 
@@ -1297,7 +1641,6 @@ def main():
     )
     btn_send.pack()
 
-    # Estado
     status_box = ttk.LabelFrame(bajas_inner, text="Estado", padding=12)
     status_box.pack(fill="x", padx=30, pady=(0, 16))
 
@@ -1370,13 +1713,10 @@ def main():
     stock_scroll.pack(side="right", fill="y")
 
     # =========================================================
-    # PESTAÑA EDITOR DE STOCK (ADMIN)
+    # PESTAÑA EDITOR DE STOCK
     # =========================================================
-
-    # Estado de acceso
     editor_unlocked = {"value": False}
 
-    # Frame de bloqueo (pantalla de contraseña)
     lock_frame = tb.Frame(tab_editor)
     lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
@@ -1399,10 +1739,8 @@ def main():
         foreground="gray"
     ).pack(pady=(4, 20))
 
-    # Frame del editor (oculto hasta que se desbloquee)
     editor_frame = tb.Frame(tab_editor)
 
-    # — Encabezado del editor —
     editor_header = tb.Frame(editor_frame)
     editor_header.pack(fill="x", pady=(0, 10))
 
@@ -1412,6 +1750,14 @@ def main():
         font=("Segoe UI", 18, "bold")
     ).pack(side="left")
 
+    btn_enviar_cambios = tb.Button(
+        editor_header,
+        text="ENVIAR TODOS LOS CAMBIOS",
+        bootstyle=DANGER,
+        width=28
+    )
+    btn_enviar_cambios.pack(side="right", padx=(6, 0))
+
     btn_refresh_editor = tb.Button(
         editor_header,
         text="Actualizar",
@@ -1419,6 +1765,14 @@ def main():
         width=14
     )
     btn_refresh_editor.pack(side="right", padx=(6, 0))
+
+    btn_descartar_cambios = tb.Button(
+        editor_header,
+        text="Descartar cambios",
+        bootstyle=SECONDARY,
+        width=18
+    )
+    btn_descartar_cambios.pack(side="right", padx=(6, 0))
 
     btn_lock_editor = tb.Button(
         editor_header,
@@ -1430,12 +1784,14 @@ def main():
 
     tb.Label(
         editor_frame,
-        text="Seleccioná un producto de la tabla para editar su stock. Los cambios reemplazan el stock actual de forma absoluta.",
+        text=(
+            "Editá directamente en la tabla las columnas 'Pallets nuevos' y 'Packs nuevos' "
+            "con doble clic. Luego enviá todos los cambios juntos."
+        ),
         font=("Segoe UI", 9),
         foreground="gray"
     ).pack(anchor="w", pady=(0, 8))
 
-    # — Tabla del editor —
     editor_card = ttk.LabelFrame(editor_frame, text="Productos y stock", padding=10)
     editor_card.pack(fill="both", expand=True)
 
@@ -1444,21 +1800,35 @@ def main():
 
     editor_tree = ttk.Treeview(
         editor_table_frame,
-        columns=("codigo", "descripcion", "pallets", "packs"),
+        columns=(
+            "codigo",
+            "descripcion",
+            "pallets_actuales",
+            "packs_actuales",
+            "pallets_nuevos",
+            "packs_nuevos",
+            "diferencia"
+        ),
         show="headings",
-        height=14,
+        height=16,
         selectmode="browse"
     )
 
     editor_tree.heading("codigo", text="Código")
     editor_tree.heading("descripcion", text="Descripción")
-    editor_tree.heading("pallets", text="Pallets actuales")
-    editor_tree.heading("packs", text="Packs actuales")
+    editor_tree.heading("pallets_actuales", text="Pallets actuales")
+    editor_tree.heading("packs_actuales", text="Packs actuales")
+    editor_tree.heading("pallets_nuevos", text="Pallets nuevos")
+    editor_tree.heading("packs_nuevos", text="Packs nuevos")
+    editor_tree.heading("diferencia", text="Diferencia")
 
-    editor_tree.column("codigo", width=90, anchor="center")
-    editor_tree.column("descripcion", width=520, anchor="w")
-    editor_tree.column("pallets", width=140, anchor="center")
-    editor_tree.column("packs", width=140, anchor="center")
+    editor_tree.column("codigo", width=80, anchor="center")
+    editor_tree.column("descripcion", width=420, anchor="w")
+    editor_tree.column("pallets_actuales", width=120, anchor="center")
+    editor_tree.column("packs_actuales", width=110, anchor="center")
+    editor_tree.column("pallets_nuevos", width=120, anchor="center")
+    editor_tree.column("packs_nuevos", width=110, anchor="center")
+    editor_tree.column("diferencia", width=220, anchor="center")
 
     editor_scroll = ttk.Scrollbar(editor_table_frame, orient="vertical", command=editor_tree.yview)
     editor_tree.configure(yscrollcommand=editor_scroll.set)
@@ -1466,44 +1836,15 @@ def main():
     editor_tree.pack(side="left", fill="both", expand=True)
     editor_scroll.pack(side="right", fill="y")
 
-    # — Panel de edición —
-    edit_panel = ttk.LabelFrame(editor_frame, text="Modificar stock del producto seleccionado", padding=16)
+    edit_panel = ttk.LabelFrame(editor_frame, text="Estado de los ajustes", padding=12)
     edit_panel.pack(fill="x", pady=(10, 0))
 
-    edit_info_var = tk.StringVar(value="Seleccioná un producto de la tabla para editar.")
-    tb.Label(edit_panel, textvariable=edit_info_var, font=("Segoe UI", 10, "italic"), foreground="#555").grid(
-        row=0, column=0, columnspan=4, sticky="w", pady=(0, 10)
-    )
-
-    tb.Label(edit_panel, text="Nuevo valor Pallets:", font=("Segoe UI", 11)).grid(
-        row=1, column=0, sticky="e", padx=(0, 10), pady=6
-    )
-    edit_pallets_var = tk.StringVar(value="")
-    edit_pallets_entry = tb.Entry(edit_panel, textvariable=edit_pallets_var, width=10, font=("Segoe UI", 11))
-    edit_pallets_entry.grid(row=1, column=1, sticky="w", pady=6)
-
-    tb.Label(edit_panel, text="Nuevo valor Packs:", font=("Segoe UI", 11)).grid(
-        row=1, column=2, sticky="e", padx=(20, 10), pady=6
-    )
-    edit_packs_var = tk.StringVar(value="")
-    edit_packs_entry = tb.Entry(edit_panel, textvariable=edit_packs_var, width=10, font=("Segoe UI", 11))
-    edit_packs_entry.grid(row=1, column=3, sticky="w", pady=6)
-
-    edit_status_var = tk.StringVar(value="")
+    edit_status_var = tk.StringVar(value="Sin cambios pendientes.")
     edit_status_label = tb.Label(edit_panel, textvariable=edit_status_var, font=("Segoe UI", 10))
-    edit_status_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-    btn_aplicar = tb.Button(
-        edit_panel,
-        text="APLICAR CAMBIO",
-        bootstyle=DANGER,
-        width=22,
-        state="disabled"
-    )
-    btn_aplicar.grid(row=2, column=3, sticky="e", pady=(4, 0))
+    edit_status_label.pack(anchor="w")
 
     # =========================================================
-    # FUNCIONES UI
+    # FUNCIONES UI STOCK / EDITOR
     # =========================================================
     def refresh_stock_box():
         for item in stock_tree.get_children():
@@ -1511,11 +1852,14 @@ def main():
 
         try:
             rows = get_stock_summary_by_product(conn)
+
             if not rows:
                 stock_tree.insert("", "end", values=("-", "Sin stock disponible", 0, 0))
                 return
+
             for pid, desc, pallets, packs in rows:
                 stock_tree.insert("", "end", values=(pid, desc, pallets, packs))
+
         except Exception as e:
             stock_tree.insert("", "end", values=("-", f"Error al cargar stock: {e}", "-", "-"))
 
@@ -1525,78 +1869,208 @@ def main():
 
         try:
             rows = get_stock_summary_all_products(conn)
+
             if not rows:
-                editor_tree.insert("", "end", values=("-", "Sin productos", 0, 0))
+                editor_tree.insert("", "end", values=("-", "Sin productos", 0, 0, 0, 0, "Sin cambios"))
                 return
+
             for pid, desc, pallets, packs in rows:
                 tag = "con_stock" if (pallets > 0 or packs > 0) else "sin_stock"
-                editor_tree.insert("", "end", values=(pid, desc, pallets, packs), tags=(tag,))
+                editor_tree.insert(
+                    "",
+                    "end",
+                    values=(pid, desc, pallets, packs, pallets, packs, "Sin cambios"),
+                    tags=(tag,)
+                )
 
             editor_tree.tag_configure("con_stock", background="#e8f5e9")
             editor_tree.tag_configure("sin_stock", background="#ffffff")
+            edit_status_var.set("🟢 Stock cargado. Editá con doble clic las columnas de nuevos valores.")
+            edit_status_label.configure(foreground="green")
+
         except Exception as e:
-            editor_tree.insert("", "end", values=("-", f"Error: {e}", "-", "-"))
-
-    def on_editor_tree_select(event=None):
-        selected = editor_tree.selection()
-        if not selected:
-            edit_info_var.set("Seleccioná un producto de la tabla para editar.")
-            edit_pallets_var.set("")
-            edit_packs_var.set("")
-            edit_status_var.set("")
-            btn_aplicar.configure(state="disabled")
-            return
-
-        values = editor_tree.item(selected[0], "values")
-        pid = values[0]
-        desc = values[1]
-        pallets_act = values[2]
-        packs_act = values[3]
-
-        edit_info_var.set(f"Editando: [{pid}] {desc}   —   Stock actual: {pallets_act} pallets / {packs_act} packs")
-        edit_pallets_var.set(str(pallets_act))
-        edit_packs_var.set(str(packs_act))
-        edit_status_var.set("")
-        btn_aplicar.configure(state="normal")
-
-    def aplicar_cambio_stock():
-        selected = editor_tree.selection()
-        if not selected:
-            messagebox.showwarning("Sin selección", "Seleccioná un producto primero.", parent=root)
-            return
-
-        values = editor_tree.item(selected[0], "values")
-        pid = int(values[0])
-        desc = values[1]
-        pallets_act = int(values[2])
-        packs_act = int(values[3])
-
-        # Validar entradas
-        p_str = edit_pallets_var.get().strip()
-        pk_str = edit_packs_var.get().strip()
-
-        if not p_str.isdigit() or not pk_str.isdigit():
-            edit_status_var.set("❌ Los valores deben ser números enteros ≥ 0.")
+            editor_tree.insert("", "end", values=("-", f"Error: {e}", "-", "-", "-", "-", "-"))
+            edit_status_var.set(f"❌ Error al cargar editor: {e}")
             edit_status_label.configure(foreground="red")
+
+    def safe_int(value, field_name="valor"):
+        value = str(value).strip()
+
+        if value == "":
+            raise ValueError(f"El campo {field_name} no puede estar vacío.")
+
+        if not value.isdigit():
+            raise ValueError(f"El campo {field_name} debe ser un número entero mayor o igual a 0.")
+
+        return int(value)
+
+    def recalcular_diferencia_item(item_id):
+        vals = list(editor_tree.item(item_id, "values"))
+
+        try:
+            pallets_actuales = int(vals[2])
+            packs_actuales = int(vals[3])
+            pallets_nuevos = safe_int(vals[4], "Pallets nuevos")
+            packs_nuevos = safe_int(vals[5], "Packs nuevos")
+
+            diff_p = pallets_nuevos - pallets_actuales
+            diff_pk = packs_nuevos - packs_actuales
+
+            vals[6] = format_diff(diff_p, diff_pk)
+
+            if diff_p != 0 or diff_pk != 0:
+                editor_tree.item(item_id, values=vals, tags=("modificado",))
+            else:
+                tag = "con_stock" if (pallets_actuales > 0 or packs_actuales > 0) else "sin_stock"
+                editor_tree.item(item_id, values=vals, tags=(tag,))
+
+            editor_tree.tag_configure("modificado", background="#fff3cd")
+            editor_tree.tag_configure("con_stock", background="#e8f5e9")
+            editor_tree.tag_configure("sin_stock", background="#ffffff")
+
+            cambios = get_editor_changes(validar=False)
+            if cambios:
+                edit_status_var.set(f"✏️ Hay {len(cambios)} cambio(s) pendiente(s).")
+                edit_status_label.configure(foreground="#b7791f")
+            else:
+                edit_status_var.set("Sin cambios pendientes.")
+                edit_status_label.configure(foreground="gray")
+
+        except Exception as e:
+            vals[6] = f"Error: {e}"
+            editor_tree.item(item_id, values=vals, tags=("error",))
+            editor_tree.tag_configure("error", background="#f8d7da")
+
+    def editar_celda_editor(event):
+        region = editor_tree.identify("region", event.x, event.y)
+
+        if region != "cell":
             return
 
-        nuevo_pallets = int(p_str)
-        nuevo_packs = int(pk_str)
+        row_id = editor_tree.identify_row(event.y)
+        col_id = editor_tree.identify_column(event.x)
 
-        # Sin cambios
-        if nuevo_pallets == pallets_act and nuevo_packs == packs_act:
-            edit_status_var.set("ℹ️ No hay cambios respecto al stock actual.")
-            edit_status_label.configure(foreground="gray")
+        # Columnas editables:
+        # #5 = pallets_nuevos
+        # #6 = packs_nuevos
+        if not row_id or col_id not in ("#5", "#6"):
             return
 
-        # Confirmación
+        col_index = int(col_id.replace("#", "")) - 1
+        bbox = editor_tree.bbox(row_id, col_id)
+
+        if not bbox:
+            return
+
+        x, y, width, height = bbox
+        current_values = list(editor_tree.item(row_id, "values"))
+        current_value = current_values[col_index]
+
+        editor = tb.Entry(editor_tree, width=max(8, int(width / 10)))
+        editor.insert(0, str(current_value))
+        editor.select_range(0, "end")
+        editor.place(x=x, y=y, width=width, height=height)
+        editor.focus_set()
+
+        def save_edit(event=None):
+            new_value = editor.get().strip()
+
+            try:
+                safe_int(new_value, "stock nuevo")
+                vals = list(editor_tree.item(row_id, "values"))
+                vals[col_index] = new_value
+                editor_tree.item(row_id, values=vals)
+                recalcular_diferencia_item(row_id)
+
+            except Exception as e:
+                messagebox.showerror("Valor inválido", str(e), parent=root)
+
+            finally:
+                try:
+                    editor.destroy()
+                except Exception:
+                    pass
+
+        editor.bind("<Return>", save_edit)
+        editor.bind("<FocusOut>", save_edit)
+        editor.bind("<Escape>", lambda e: editor.destroy())
+
+    def get_editor_changes(validar=True):
+        cambios = []
+
+        for item in editor_tree.get_children():
+            vals = list(editor_tree.item(item, "values"))
+
+            if len(vals) < 7:
+                continue
+
+            try:
+                pid = int(vals[0])
+                desc = str(vals[1])
+                pallets_actuales = int(vals[2])
+                packs_actuales = int(vals[3])
+                pallets_nuevos = safe_int(vals[4], f"Pallets nuevos del producto {pid}")
+                packs_nuevos = safe_int(vals[5], f"Packs nuevos del producto {pid}")
+
+                if pallets_nuevos != pallets_actuales or packs_nuevos != packs_actuales:
+                    cambios.append({
+                        "id_producto": pid,
+                        "descripcion": desc,
+                        "pallets_actuales": pallets_actuales,
+                        "packs_actuales": packs_actuales,
+                        "nuevo_pallets": pallets_nuevos,
+                        "nuevo_packs": packs_nuevos,
+                        "diff_pallets": pallets_nuevos - pallets_actuales,
+                        "diff_packs": packs_nuevos - packs_actuales,
+                    })
+
+            except Exception:
+                if validar:
+                    raise
+                continue
+
+        return cambios
+
+    def build_confirmacion_cambios(cambios):
+        lineas = [
+            f"Se van a aplicar {len(cambios)} ajuste(s) de stock.",
+            "",
+            "Resumen:",
+            "",
+        ]
+
+        for c in cambios[:15]:
+            lineas.append(
+                f"[{c['id_producto']}] {c['descripcion']}\n"
+                f"  Actual: {c['pallets_actuales']} pallets / {c['packs_actuales']} packs\n"
+                f"  Nuevo:  {c['nuevo_pallets']} pallets / {c['nuevo_packs']} packs\n"
+                f"  Dif.:   {format_diff(c['diff_pallets'], c['diff_packs'])}\n"
+            )
+
+        if len(cambios) > 15:
+            lineas.append(f"... y {len(cambios) - 15} producto(s) más.")
+
+        lineas.append("")
+        lineas.append("Esta acción aplicará todos los cambios juntos y enviará un mail informando las diferencias.")
+        lineas.append("¿Confirmás continuar?")
+
+        return "\n".join(lineas)
+
+    def enviar_todos_los_cambios():
+        try:
+            cambios = get_editor_changes(validar=True)
+
+        except Exception as e:
+            messagebox.showerror("Valores inválidos", str(e), parent=root)
+            return
+
+        if not cambios:
+            messagebox.showinfo("Sin cambios", "No hay cambios pendientes para enviar.", parent=root)
+            return
+
         confirm = messagebox.askyesno(
-            "Confirmar cambio de stock",
-            f"Producto: [{pid}] {desc}\n\n"
-            f"Stock ACTUAL:  {pallets_act} pallets  /  {packs_act} packs\n"
-            f"Stock NUEVO:   {nuevo_pallets} pallets  /  {nuevo_packs} packs\n\n"
-            "Esta acción REEMPLAZA el stock completo del producto.\n"
-            "¿Confirmás el cambio?",
+            "Confirmar envío de ajustes",
+            build_confirmacion_cambios(cambios),
             parent=root
         )
 
@@ -1606,39 +2080,56 @@ def main():
             return
 
         try:
-            btn_aplicar.configure(state="disabled", text="Procesando...")
+            btn_enviar_cambios.configure(state="disabled", text="Procesando...")
+            btn_refresh_editor.configure(state="disabled")
+            btn_descartar_cambios.configure(state="disabled")
             root.update_idletasks()
 
-            desc_ret, net_p, net_pk = set_stock_directo(conn, pid, nuevo_pallets, nuevo_packs)
+            resultados = set_stock_lote(conn, cambios)
 
-            # Sync Google Sheet async
-            _sync_google_stock_async(pid, desc_ret, net_p, net_pk)
+            if not resultados:
+                edit_status_var.set("ℹ️ No hubo cambios para aplicar.")
+                edit_status_label.configure(foreground="gray")
+                return
+
+            for cambio in resultados:
+                _sync_google_stock_async(
+                    cambio["id_producto"],
+                    cambio["descripcion"],
+                    cambio["pallets_despues"],
+                    cambio["packs_despues"]
+                )
+
+            send_stock_changes_email_async(resultados)
 
             edit_status_var.set(
-                f"✅ Stock actualizado: {net_p} pallets / {net_pk} packs  —  Sincronizando con Google Sheet..."
+                f"✅ Se aplicaron {len(resultados)} ajuste(s). "
+                f"Se está sincronizando Google Sheet y enviando el mail a {EMAIL_AJUSTES_TO}."
             )
             edit_status_label.configure(foreground="green")
 
-            # Refrescar tablas
+            set_status(
+                f"✅ Ajustes de stock aplicados: {len(resultados)} producto(s).\n"
+                f"Se está sincronizando Google Sheet y enviando el mail a {EMAIL_AJUSTES_TO}."
+            )
+
             refresh_editor_tree()
             refresh_stock_box()
-
-            # Reseleccionar el mismo producto en el editor
-            for item in editor_tree.get_children():
-                if editor_tree.item(item, "values")[0] == str(pid):
-                    editor_tree.selection_set(item)
-                    editor_tree.see(item)
-                    on_editor_tree_select()
-                    break
+            refresh_product_combo()
 
         except Exception as e:
-            edit_status_var.set(f"❌ Error: {e}")
+            edit_status_var.set(f"❌ Error al aplicar ajustes: {e}")
             edit_status_label.configure(foreground="red")
-        finally:
-            btn_aplicar.configure(state="normal", text="APLICAR CAMBIO")
+            messagebox.showerror("Error al aplicar ajustes", str(e), parent=root)
 
-    editor_tree.bind("<<TreeviewSelect>>", on_editor_tree_select)
-    btn_aplicar.configure(command=aplicar_cambio_stock)
+        finally:
+            btn_enviar_cambios.configure(state="normal", text="ENVIAR TODOS LOS CAMBIOS")
+            btn_refresh_editor.configure(state="normal")
+            btn_descartar_cambios.configure(state="normal")
+
+    editor_tree.bind("<Double-1>", editar_celda_editor)
+    btn_enviar_cambios.configure(command=enviar_todos_los_cambios)
+    btn_descartar_cambios.configure(command=refresh_editor_tree)
     btn_refresh_editor.configure(command=refresh_editor_tree)
 
     def bloquear_editor():
@@ -1655,7 +2146,6 @@ def main():
             editor_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
             refresh_editor_tree()
         else:
-            # Volver a la pestaña anterior si cancela
             notebook.select(0)
 
     btn_desbloquear = tb.Button(
@@ -1672,6 +2162,7 @@ def main():
     # =========================================================
     def on_product_select(event=None):
         val = prod_var.get()
+
         if not val:
             lote_combo["values"] = []
             lote_var.set("")
@@ -1682,6 +2173,7 @@ def main():
             lotes = get_lotes_for_product(conn, pid)
             lote_combo["values"] = lotes
             lote_var.set(lotes[0] if lotes else "")
+
         except Exception:
             lote_combo["values"] = []
             lote_var.set("")
@@ -1707,26 +2199,34 @@ def main():
     def limpiar_formulario():
         cant_var.set("")
         obs_manual_var.set("")
+
         if motivo_var.get() == "Venta":
             cliente_var.set("")
+
         cant_entry.focus_set()
 
     def submit_manual():
         try:
             pstr = prod_var.get()
+
             if not pstr:
                 raise ValueError("Seleccioná un producto.")
+
             pid = int(pstr.split(" - ")[0])
 
             lote = lote_var.get().strip()
+
             if not lote:
                 raise ValueError("Seleccioná un lote.")
 
             tipo = type_var.get()
             qty_str = cant_var.get().strip()
+
             if not qty_str.isdigit():
                 raise ValueError("La cantidad debe ser un número entero.")
+
             qty = int(qty_str)
+
             if qty <= 0:
                 raise ValueError("La cantidad debe ser mayor que 0.")
 
@@ -1738,11 +2238,26 @@ def main():
                 raise ValueError("Debes seleccionar o escribir un cliente cuando el motivo es Venta.")
 
             (
-                baja_id, pid, desc, lote, tipo_unidad,
-                cantidad, net_p, net_pk, series_afectadas,
-                cliente_final, cliente_creado
+                baja_id,
+                pid,
+                desc,
+                lote,
+                tipo_unidad,
+                cantidad,
+                net_p,
+                net_pk,
+                series_afectadas,
+                cliente_final,
+                cliente_creado
             ) = baja_manual(
-                conn, pid, lote, tipo, qty, motivo, obs, cliente
+                conn,
+                pid,
+                lote,
+                tipo,
+                qty,
+                motivo,
+                obs,
+                cliente
             )
 
             refresh_client_combo_values(cliente_final)
@@ -1782,12 +2297,14 @@ def main():
     def on_tab_changed(event=None):
         try:
             current_index = notebook.index(notebook.select())
+
             if current_index == 1:
                 refresh_stock_box()
+
             elif current_index == 2:
-                # Si no está desbloqueado, pedir contraseña
                 if not editor_unlocked["value"]:
                     desbloquear_editor()
+
         except Exception:
             pass
 
