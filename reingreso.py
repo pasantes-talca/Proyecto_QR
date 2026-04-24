@@ -325,7 +325,7 @@ class ReingresoApp:
                  font=("Segoe UI", 22, "bold")).pack(pady=(20, 6))
 
         # ── Selector de Motivo ───────────────────────────────────────────────
-        motivo_frame = tb.LabelFrame(root, text="Filtrar por motivo de baja")
+        motivo_frame = tb.Labelframe(root, text="Filtrar por motivo de baja")
         motivo_frame.pack(pady=(0, 8), padx=50, fill="x")
 
         self.motivo_var = StringVar(value="Venta")
@@ -336,7 +336,7 @@ class ReingresoApp:
             ).pack(side="left", padx=18, pady=8)
 
         # ── Datos del reingreso ──────────────────────────────────────────────
-        frame = tb.LabelFrame(root, text="Datos del reingreso")
+        frame = tb.Labelframe(root, text="Datos del reingreso")
         frame.pack(pady=6, padx=50, fill="x")
 
         tb.Label(frame, text="Producto:").grid(row=0, column=0, sticky="e", padx=10, pady=10)
