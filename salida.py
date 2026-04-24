@@ -9,7 +9,7 @@ import unicodedata
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, simpledialog
 
 try:
     import psycopg2
@@ -22,6 +22,8 @@ except Exception:
 # =======================
 root = None
 status_text = None
+
+PASSWORD_ADMIN = "Talca2026**"
 
 
 def set_status(text: str):
@@ -68,7 +70,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 DEFAULT_PG = {
     "host": "10.242.4.13",
     "port": 5432,
-    "dbname": "stock",
+    "dbname": "stock_copia",
     "user": "postgres",
     "password": "Talca2025",
     "client_encoding": "WIN1252",
@@ -243,9 +245,6 @@ def pg_connect():
 
 
 def init_tables(conn):
-    """
-    Asegura columnas necesarias en bajas y crea tabla clientes si no existe.
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tbajas = cfg["table_bajas"]
@@ -254,7 +253,6 @@ def init_tables(conn):
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
 
-        # Columnas en bajas
         for col, definition in [
             ("motivo", "TEXT NOT NULL DEFAULT 'Venta'"),
             ("observaciones", "TEXT"),
@@ -278,7 +276,6 @@ def init_tables(conn):
                 END $$;
             """)
 
-        # Tabla clientes
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {schema}.{tclients} (
                 id SERIAL PRIMARY KEY,
@@ -289,7 +286,6 @@ def init_tables(conn):
             );
         """)
 
-        # Asegurar columnas en clientes si la tabla ya existía vieja
         for col, definition in [
             ("nombre", "TEXT"),
             ("nombre_normalizado", "TEXT"),
@@ -312,7 +308,6 @@ def init_tables(conn):
                 END $$;
             """)
 
-        # Unique constraint para evitar duplicados lógicos
         fk_name = f"fk_{tbajas}_{tclients}"
         uq_name = f"uq_{tclients}_nombre_normalizado"
 
@@ -331,7 +326,6 @@ def init_tables(conn):
             END $$;
         """)
 
-        # FK bajas.id_cliente -> clientes.id
         cur.execute(f"""
             DO $$
             BEGIN
@@ -349,7 +343,6 @@ def init_tables(conn):
             END $$;
         """)
 
-        # Cargar clientes iniciales
         for nombre in CLIENTES_INICIALES:
             nombre_limpio = normalize_client_name(nombre)
             nombre_norm = normalize_client_key(nombre_limpio)
@@ -397,14 +390,6 @@ def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
 
 
 def send_update_row_to_sheet(id_producto: int, descripcion: str, pallets: int, packs: int) -> dict:
-    """
-    Envía al Google Sheet el stock actualizado de un producto.
-
-    IMPORTANTE:
-    Además de la descripción, ahora se envía el código/id_producto.
-    Esto permite que el Apps Script busque el producto por la columna C
-    y escriba el stock de pallets en la columna H.
-    """
     _, api_key = get_sheet_settings()
 
     pallets_val = int(pallets or 0)
@@ -414,14 +399,11 @@ def send_update_row_to_sheet(id_producto: int, descripcion: str, pallets: int, p
         "api_key": api_key,
         "action": "scan_pp",
         "type": "scan_pp",
-
         "codigo": int(id_producto),
         "id_producto": int(id_producto),
         "descripcion": str(descripcion),
-
         "stock_pallets": pallets_val,
         "stock_packs": packs_val,
-
         "pallet": pallets_val,
         "bulto": packs_val,
     }
@@ -474,6 +456,21 @@ def get_products_with_stock(conn):
                   )
             )
             ORDER BY p.id ASC;
+        """)
+        return cur.fetchall()
+
+
+def get_all_products(conn):
+    """Devuelve todos los productos (incluso sin stock) para el editor."""
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tprod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT id, descripcion
+            FROM {schema}.{tprod}
+            ORDER BY id ASC;
         """)
         return cur.fetchall()
 
@@ -559,6 +556,53 @@ def get_stock_summary_by_product(conn):
     return result
 
 
+def get_stock_summary_all_products(conn):
+    """
+    Devuelve todos los productos con su stock actual (incluyendo los que tienen 0).
+    Usado por el editor de stock administrativo.
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tprod = cfg["table_products"]
+    tstock = cfg["table_stock"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                p.id,
+                p.descripcion,
+                COALESCE(SUM(
+                    CASE
+                        WHEN UPPER(BTRIM(COALESCE(s.tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
+                        THEN 1
+                        ELSE 0
+                    END
+                ), 0) AS pallets,
+                COALESCE(SUM(
+                    CASE
+                        WHEN UPPER(BTRIM(COALESCE(s.tipo_unidad, ''))) = 'PACKS'
+                        THEN COALESCE(s.packs, 0)
+                        ELSE 0
+                    END
+                ), 0) AS packs
+            FROM {schema}.{tprod} p
+            LEFT JOIN {schema}.{tstock} s
+              ON s.id_producto = p.id
+            GROUP BY p.id, p.descripcion
+            ORDER BY p.id ASC;
+        """)
+        rows = cur.fetchall()
+
+    result = []
+    for row in rows:
+        pid = int(row[0])
+        desc = str(row[1]).strip() if row[1] else "Sin descripción"
+        pallets = int(row[2] or 0)
+        packs = int(row[3] or 0)
+        result.append((pid, desc, pallets, packs))
+    return result
+
+
 def compute_net_available_lote(conn, id_producto: int, lote: str):
     cfg = get_pg_config()
     schema = cfg["schema"]
@@ -625,13 +669,114 @@ def get_product_net_stock(conn, id_producto: int):
 
 
 # =======================
+#   AJUSTE DIRECTO DE STOCK (ADMIN)
+# =======================
+def set_stock_directo(conn, id_producto: int, nuevo_pallets: int, nuevo_packs: int):
+    """
+    Ajusta el stock de un producto a los valores absolutos indicados.
+
+    Estrategia:
+      - Obtiene el lote más reciente del producto (o usa 'AJUSTE' si no hay ninguno).
+      - Elimina TODOS los registros de stock existentes para ese producto.
+      - Si nuevo_pallets > 0: inserta N filas tipo PALLET con nro_serie sintético.
+      - Si nuevo_packs > 0: inserta 1 fila tipo PACKS con el valor indicado.
+      - Actualiza la tabla sheet.
+      - Retorna (descripcion, nuevo_pallets, nuevo_packs).
+    """
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+    tprod = cfg["table_products"]
+    tsheet = cfg["table_sheet"]
+
+    pid = int(id_producto)
+    nuevo_pallets = int(nuevo_pallets)
+    nuevo_packs = int(nuevo_packs)
+
+    if nuevo_pallets < 0 or nuevo_packs < 0:
+        raise ValueError("Los valores de stock no pueden ser negativos.")
+
+    prev_autocommit = conn.autocommit
+
+    try:
+        conn.autocommit = False
+
+        with conn.cursor() as cur:
+            # Descripción del producto
+            cur.execute(f"SELECT descripcion FROM {schema}.{tprod} WHERE id = %s;", (pid,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"No existe el producto con id={pid}.")
+            desc = str(row[0]).strip() if row[0] else "Sin descripción"
+
+            # Obtener lote representativo (el más frecuente o cualquiera)
+            cur.execute(f"""
+                SELECT lote
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                ORDER BY id DESC
+                LIMIT 1;
+            """, (pid,))
+            lote_row = cur.fetchone()
+            lote = str(lote_row[0]).strip() if lote_row else "AJUSTE"
+
+            # Obtener nro_serie máximo actual para no pisar
+            cur.execute(f"""
+                SELECT COALESCE(MAX(nro_serie), 0)
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s;
+            """, (pid,))
+            max_serie_row = cur.fetchone()
+            base_serie = int(max_serie_row[0] or 0) + 1
+
+            # Borrar TODO el stock del producto
+            cur.execute(f"""
+                DELETE FROM {schema}.{tstock}
+                WHERE id_producto = %s;
+            """, (pid,))
+
+            # Insertar filas de PALLET (una por pallet)
+            for i in range(nuevo_pallets):
+                cur.execute(f"""
+                    INSERT INTO {schema}.{tstock}
+                        (id_producto, lote, tipo_unidad, nro_serie, packs)
+                    VALUES (%s, %s, 'PALLET', %s, NULL);
+                """, (pid, lote, base_serie + i))
+
+            # Insertar fila de PACKS si hay
+            if nuevo_packs > 0:
+                serie_packs = base_serie + nuevo_pallets
+                cur.execute(f"""
+                    INSERT INTO {schema}.{tstock}
+                        (id_producto, lote, tipo_unidad, nro_serie, packs)
+                    VALUES (%s, %s, 'PACKS', %s, %s);
+                """, (pid, lote, serie_packs, nuevo_packs))
+
+            # Actualizar tabla sheet
+            cur.execute(f"""
+                INSERT INTO {schema}.{tsheet}(id_producto, stock_pallets, stock_packs)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (id_producto)
+                DO UPDATE SET stock_pallets = EXCLUDED.stock_pallets,
+                              stock_packs   = EXCLUDED.stock_packs;
+            """, (pid, nuevo_pallets, nuevo_packs))
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.autocommit = prev_autocommit
+
+    return desc, nuevo_pallets, nuevo_packs
+
+
+# =======================
 #   ELIMINAR DE STOCK
 # =======================
 def delete_from_stock_iterative(conn, id_producto: int, lote: str, tipo_unidad: str, cantidad: int):
-    """
-    Descuenta stock real de forma iterativa y segura.
-    Devuelve el detalle de series afectadas.
-    """
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -852,6 +997,75 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 
 
 # =======================
+#   DIALOGO CONTRASEÑA
+# =======================
+def pedir_contrasena(parent) -> bool:
+    """
+    Muestra un diálogo modal pidiendo contraseña.
+    Retorna True si la contraseña es correcta, False si cancela o falla.
+    """
+    dialog = tk.Toplevel(parent)
+    dialog.title("Acceso restringido")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.focus_set()
+
+    # Centrar sobre la ventana padre
+    parent.update_idletasks()
+    px = parent.winfo_x() + parent.winfo_width() // 2
+    py = parent.winfo_y() + parent.winfo_height() // 2
+    dialog.geometry(f"380x200+{px - 190}+{py - 100}")
+
+    resultado = {"ok": False}
+
+    frame = tb.Frame(dialog, padding=24)
+    frame.pack(fill="both", expand=True)
+
+    tb.Label(
+        frame,
+        text="🔒  Zona Administrativa",
+        font=("Segoe UI", 13, "bold")
+    ).pack(pady=(0, 6))
+
+    tb.Label(
+        frame,
+        text="Ingresá la contraseña para continuar:",
+        font=("Segoe UI", 10)
+    ).pack(pady=(0, 10))
+
+    pwd_var = tk.StringVar()
+    pwd_entry = tb.Entry(frame, textvariable=pwd_var, show="*", width=28, font=("Segoe UI", 11))
+    pwd_entry.pack(pady=(0, 6))
+    pwd_entry.focus_set()
+
+    error_label = tb.Label(frame, text="", foreground="red", font=("Segoe UI", 9))
+    error_label.pack()
+
+    def confirmar(event=None):
+        if pwd_var.get() == PASSWORD_ADMIN:
+            resultado["ok"] = True
+            dialog.destroy()
+        else:
+            error_label.configure(text="Contraseña incorrecta. Intentá de nuevo.")
+            pwd_var.set("")
+            pwd_entry.focus_set()
+
+    def cancelar():
+        dialog.destroy()
+
+    btn_frame = tb.Frame(frame)
+    btn_frame.pack(pady=(10, 0))
+
+    tb.Button(btn_frame, text="Ingresar", bootstyle=SUCCESS, width=12, command=confirmar).pack(side="left", padx=6)
+    tb.Button(btn_frame, text="Cancelar", bootstyle=SECONDARY, width=12, command=cancelar).pack(side="left", padx=6)
+
+    pwd_entry.bind("<Return>", confirmar)
+
+    dialog.wait_window()
+    return resultado["ok"]
+
+
+# =======================
 #   UI
 # =======================
 MOTIVOS = ("Venta", "Calidad", "Desarme", "Observacion")
@@ -890,14 +1104,19 @@ def main():
     notebook.pack(fill="both", expand=True)
 
     # =========================================================
-    # TAB BAJAS CON SCROLL
+    # TABS
     # =========================================================
     tab_bajas = tb.Frame(notebook)
     tab_stock = tb.Frame(notebook, padding=18)
+    tab_editor = tb.Frame(notebook, padding=18)
 
     notebook.add(tab_bajas, text="Bajas")
     notebook.add(tab_stock, text="Stock actual")
+    notebook.add(tab_editor, text="🔒 Editor de stock")
 
+    # =========================================================
+    # TAB BAJAS CON SCROLL
+    # =========================================================
     bajas_canvas = tk.Canvas(tab_bajas, highlightthickness=0)
     bajas_scrollbar = ttk.Scrollbar(tab_bajas, orient="vertical", command=bajas_canvas.yview)
     bajas_canvas.configure(yscrollcommand=bajas_scrollbar.set)
@@ -1078,7 +1297,7 @@ def main():
     )
     btn_send.pack()
 
-    # Estado con scroll propio
+    # Estado
     status_box = ttk.LabelFrame(bajas_inner, text="Estado", padding=12)
     status_box.pack(fill="x", padx=30, pady=(0, 16))
 
@@ -1102,7 +1321,7 @@ def main():
     set_status("🟢 Listo para registrar una baja.")
 
     # =========================================================
-    # PESTAÑA STOCK
+    # PESTAÑA STOCK ACTUAL
     # =========================================================
     header_stock = tb.Frame(tab_stock)
     header_stock.pack(fill="x", pady=(0, 10))
@@ -1151,6 +1370,139 @@ def main():
     stock_scroll.pack(side="right", fill="y")
 
     # =========================================================
+    # PESTAÑA EDITOR DE STOCK (ADMIN)
+    # =========================================================
+
+    # Estado de acceso
+    editor_unlocked = {"value": False}
+
+    # Frame de bloqueo (pantalla de contraseña)
+    lock_frame = tb.Frame(tab_editor)
+    lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    tb.Label(
+        lock_frame,
+        text="🔒",
+        font=("Segoe UI", 48)
+    ).pack(pady=(80, 10))
+
+    tb.Label(
+        lock_frame,
+        text="Esta sección es de uso administrativo.",
+        font=("Segoe UI", 13)
+    ).pack()
+
+    tb.Label(
+        lock_frame,
+        text="Hacé clic en el botón para ingresar con contraseña.",
+        font=("Segoe UI", 10),
+        foreground="gray"
+    ).pack(pady=(4, 20))
+
+    # Frame del editor (oculto hasta que se desbloquee)
+    editor_frame = tb.Frame(tab_editor)
+
+    # — Encabezado del editor —
+    editor_header = tb.Frame(editor_frame)
+    editor_header.pack(fill="x", pady=(0, 10))
+
+    tb.Label(
+        editor_header,
+        text="Editor de stock",
+        font=("Segoe UI", 18, "bold")
+    ).pack(side="left")
+
+    btn_refresh_editor = tb.Button(
+        editor_header,
+        text="Actualizar",
+        bootstyle=INFO,
+        width=14
+    )
+    btn_refresh_editor.pack(side="right", padx=(6, 0))
+
+    btn_lock_editor = tb.Button(
+        editor_header,
+        text="🔒 Bloquear",
+        bootstyle=SECONDARY,
+        width=14
+    )
+    btn_lock_editor.pack(side="right")
+
+    tb.Label(
+        editor_frame,
+        text="Seleccioná un producto de la tabla para editar su stock. Los cambios reemplazan el stock actual de forma absoluta.",
+        font=("Segoe UI", 9),
+        foreground="gray"
+    ).pack(anchor="w", pady=(0, 8))
+
+    # — Tabla del editor —
+    editor_card = ttk.LabelFrame(editor_frame, text="Productos y stock", padding=10)
+    editor_card.pack(fill="both", expand=True)
+
+    editor_table_frame = tb.Frame(editor_card)
+    editor_table_frame.pack(fill="both", expand=True)
+
+    editor_tree = ttk.Treeview(
+        editor_table_frame,
+        columns=("codigo", "descripcion", "pallets", "packs"),
+        show="headings",
+        height=14,
+        selectmode="browse"
+    )
+
+    editor_tree.heading("codigo", text="Código")
+    editor_tree.heading("descripcion", text="Descripción")
+    editor_tree.heading("pallets", text="Pallets actuales")
+    editor_tree.heading("packs", text="Packs actuales")
+
+    editor_tree.column("codigo", width=90, anchor="center")
+    editor_tree.column("descripcion", width=520, anchor="w")
+    editor_tree.column("pallets", width=140, anchor="center")
+    editor_tree.column("packs", width=140, anchor="center")
+
+    editor_scroll = ttk.Scrollbar(editor_table_frame, orient="vertical", command=editor_tree.yview)
+    editor_tree.configure(yscrollcommand=editor_scroll.set)
+
+    editor_tree.pack(side="left", fill="both", expand=True)
+    editor_scroll.pack(side="right", fill="y")
+
+    # — Panel de edición —
+    edit_panel = ttk.LabelFrame(editor_frame, text="Modificar stock del producto seleccionado", padding=16)
+    edit_panel.pack(fill="x", pady=(10, 0))
+
+    edit_info_var = tk.StringVar(value="Seleccioná un producto de la tabla para editar.")
+    tb.Label(edit_panel, textvariable=edit_info_var, font=("Segoe UI", 10, "italic"), foreground="#555").grid(
+        row=0, column=0, columnspan=4, sticky="w", pady=(0, 10)
+    )
+
+    tb.Label(edit_panel, text="Nuevo valor Pallets:", font=("Segoe UI", 11)).grid(
+        row=1, column=0, sticky="e", padx=(0, 10), pady=6
+    )
+    edit_pallets_var = tk.StringVar(value="")
+    edit_pallets_entry = tb.Entry(edit_panel, textvariable=edit_pallets_var, width=10, font=("Segoe UI", 11))
+    edit_pallets_entry.grid(row=1, column=1, sticky="w", pady=6)
+
+    tb.Label(edit_panel, text="Nuevo valor Packs:", font=("Segoe UI", 11)).grid(
+        row=1, column=2, sticky="e", padx=(20, 10), pady=6
+    )
+    edit_packs_var = tk.StringVar(value="")
+    edit_packs_entry = tb.Entry(edit_panel, textvariable=edit_packs_var, width=10, font=("Segoe UI", 11))
+    edit_packs_entry.grid(row=1, column=3, sticky="w", pady=6)
+
+    edit_status_var = tk.StringVar(value="")
+    edit_status_label = tb.Label(edit_panel, textvariable=edit_status_var, font=("Segoe UI", 10))
+    edit_status_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+    btn_aplicar = tb.Button(
+        edit_panel,
+        text="APLICAR CAMBIO",
+        bootstyle=DANGER,
+        width=22,
+        state="disabled"
+    )
+    btn_aplicar.grid(row=2, column=3, sticky="e", pady=(4, 0))
+
+    # =========================================================
     # FUNCIONES UI
     # =========================================================
     def refresh_stock_box():
@@ -1159,16 +1511,165 @@ def main():
 
         try:
             rows = get_stock_summary_by_product(conn)
-
             if not rows:
                 stock_tree.insert("", "end", values=("-", "Sin stock disponible", 0, 0))
                 return
-
             for pid, desc, pallets, packs in rows:
                 stock_tree.insert("", "end", values=(pid, desc, pallets, packs))
         except Exception as e:
             stock_tree.insert("", "end", values=("-", f"Error al cargar stock: {e}", "-", "-"))
 
+    def refresh_editor_tree():
+        for item in editor_tree.get_children():
+            editor_tree.delete(item)
+
+        try:
+            rows = get_stock_summary_all_products(conn)
+            if not rows:
+                editor_tree.insert("", "end", values=("-", "Sin productos", 0, 0))
+                return
+            for pid, desc, pallets, packs in rows:
+                tag = "con_stock" if (pallets > 0 or packs > 0) else "sin_stock"
+                editor_tree.insert("", "end", values=(pid, desc, pallets, packs), tags=(tag,))
+
+            editor_tree.tag_configure("con_stock", background="#e8f5e9")
+            editor_tree.tag_configure("sin_stock", background="#ffffff")
+        except Exception as e:
+            editor_tree.insert("", "end", values=("-", f"Error: {e}", "-", "-"))
+
+    def on_editor_tree_select(event=None):
+        selected = editor_tree.selection()
+        if not selected:
+            edit_info_var.set("Seleccioná un producto de la tabla para editar.")
+            edit_pallets_var.set("")
+            edit_packs_var.set("")
+            edit_status_var.set("")
+            btn_aplicar.configure(state="disabled")
+            return
+
+        values = editor_tree.item(selected[0], "values")
+        pid = values[0]
+        desc = values[1]
+        pallets_act = values[2]
+        packs_act = values[3]
+
+        edit_info_var.set(f"Editando: [{pid}] {desc}   —   Stock actual: {pallets_act} pallets / {packs_act} packs")
+        edit_pallets_var.set(str(pallets_act))
+        edit_packs_var.set(str(packs_act))
+        edit_status_var.set("")
+        btn_aplicar.configure(state="normal")
+
+    def aplicar_cambio_stock():
+        selected = editor_tree.selection()
+        if not selected:
+            messagebox.showwarning("Sin selección", "Seleccioná un producto primero.", parent=root)
+            return
+
+        values = editor_tree.item(selected[0], "values")
+        pid = int(values[0])
+        desc = values[1]
+        pallets_act = int(values[2])
+        packs_act = int(values[3])
+
+        # Validar entradas
+        p_str = edit_pallets_var.get().strip()
+        pk_str = edit_packs_var.get().strip()
+
+        if not p_str.isdigit() or not pk_str.isdigit():
+            edit_status_var.set("❌ Los valores deben ser números enteros ≥ 0.")
+            edit_status_label.configure(foreground="red")
+            return
+
+        nuevo_pallets = int(p_str)
+        nuevo_packs = int(pk_str)
+
+        # Sin cambios
+        if nuevo_pallets == pallets_act and nuevo_packs == packs_act:
+            edit_status_var.set("ℹ️ No hay cambios respecto al stock actual.")
+            edit_status_label.configure(foreground="gray")
+            return
+
+        # Confirmación
+        confirm = messagebox.askyesno(
+            "Confirmar cambio de stock",
+            f"Producto: [{pid}] {desc}\n\n"
+            f"Stock ACTUAL:  {pallets_act} pallets  /  {packs_act} packs\n"
+            f"Stock NUEVO:   {nuevo_pallets} pallets  /  {nuevo_packs} packs\n\n"
+            "Esta acción REEMPLAZA el stock completo del producto.\n"
+            "¿Confirmás el cambio?",
+            parent=root
+        )
+
+        if not confirm:
+            edit_status_var.set("Operación cancelada.")
+            edit_status_label.configure(foreground="gray")
+            return
+
+        try:
+            btn_aplicar.configure(state="disabled", text="Procesando...")
+            root.update_idletasks()
+
+            desc_ret, net_p, net_pk = set_stock_directo(conn, pid, nuevo_pallets, nuevo_packs)
+
+            # Sync Google Sheet async
+            _sync_google_stock_async(pid, desc_ret, net_p, net_pk)
+
+            edit_status_var.set(
+                f"✅ Stock actualizado: {net_p} pallets / {net_pk} packs  —  Sincronizando con Google Sheet..."
+            )
+            edit_status_label.configure(foreground="green")
+
+            # Refrescar tablas
+            refresh_editor_tree()
+            refresh_stock_box()
+
+            # Reseleccionar el mismo producto en el editor
+            for item in editor_tree.get_children():
+                if editor_tree.item(item, "values")[0] == str(pid):
+                    editor_tree.selection_set(item)
+                    editor_tree.see(item)
+                    on_editor_tree_select()
+                    break
+
+        except Exception as e:
+            edit_status_var.set(f"❌ Error: {e}")
+            edit_status_label.configure(foreground="red")
+        finally:
+            btn_aplicar.configure(state="normal", text="APLICAR CAMBIO")
+
+    editor_tree.bind("<<TreeviewSelect>>", on_editor_tree_select)
+    btn_aplicar.configure(command=aplicar_cambio_stock)
+    btn_refresh_editor.configure(command=refresh_editor_tree)
+
+    def bloquear_editor():
+        editor_unlocked["value"] = False
+        editor_frame.place_forget()
+        lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+    btn_lock_editor.configure(command=bloquear_editor)
+
+    def desbloquear_editor():
+        if pedir_contrasena(root):
+            editor_unlocked["value"] = True
+            lock_frame.place_forget()
+            editor_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+            refresh_editor_tree()
+        else:
+            # Volver a la pestaña anterior si cancela
+            notebook.select(0)
+
+    btn_desbloquear = tb.Button(
+        lock_frame,
+        text="🔓  Ingresar contraseña",
+        bootstyle=WARNING,
+        width=26,
+        command=desbloquear_editor
+    )
+    btn_desbloquear.pack()
+
+    # =========================================================
+    # FUNCIONES BAJAS
+    # =========================================================
     def on_product_select(event=None):
         val = prod_var.get()
         if not val:
@@ -1283,6 +1784,10 @@ def main():
             current_index = notebook.index(notebook.select())
             if current_index == 1:
                 refresh_stock_box()
+            elif current_index == 2:
+                # Si no está desbloqueado, pedir contraseña
+                if not editor_unlocked["value"]:
+                    desbloquear_editor()
         except Exception:
             pass
 
