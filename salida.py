@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import uuid
 import urllib.request
 import urllib.error
 import threading
@@ -9,6 +10,7 @@ import unicodedata
 import smtplib
 from datetime import datetime
 from email.message import EmailMessage
+import calendar
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
@@ -27,12 +29,81 @@ root = None
 status_text = None
 
 PASSWORD_ADMIN = "Talca2026**"
-EMAIL_AJUSTES_TO = "psantes@talca.com.ar"
+EMAIL_AJUSTES_TO = "pasantes@talca.com.ar"
 LOTE_AJUSTE_DEFAULT = "AJUSTE"
+
+# Usuario autenticado actualmente en la pestaña de ajustes
+USUARIO_AJUSTE_ACTUAL = None
+
+# =======================
+#   EMAIL SMTP SIN CONFIG.JSON
+# =======================
+# IMPORTANTE:
+# Reemplazá EMAIL_SMTP_PASSWORD por la clave real del correo.
+# Si el correo tiene seguridad en dos pasos, puede que necesites una clave de aplicación.
+EMAIL_SMTP_HOST = "pasantes@talca.com.ar"
+EMAIL_SMTP_PORT = 587
+EMAIL_SMTP_USER = "pasantes@talca.com.ar"
+EMAIL_SMTP_PASSWORD = os.environ.get("Talca2025", "Talca2025")
+EMAIL_FROM = "pasantes@talca.com.ar, logistica@talca.com.ar"
+EMAIL_USE_TLS = True
+
+
+def sumar_meses(fecha, meses: int):
+    mes = fecha.month - 1 + meses
+    anio = fecha.year + mes // 12
+    mes = mes % 12 + 1
+    dia = min(fecha.day, calendar.monthrange(anio, mes)[1])
+    return fecha.replace(year=anio, month=mes, day=dia)
+
+
+def get_datos_alta_ajuste():
+    hoy = datetime.now().date()
+    vencimiento = sumar_meses(hoy, 6)
+    lote = hoy.strftime("%d%m%y")
+
+    return lote, hoy.isoformat(), vencimiento.isoformat()
+
+
+def get_table_columns(conn, schema: str, table_name: str) -> set:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = %s;
+        """, (schema, table_name))
+
+        return {str(r[0]).lower() for r in cur.fetchall()}
+
+
+def get_stock_oldest_order_expr(conn, schema: str, table_name: str) -> str:
+    cols = get_table_columns(conn, schema, table_name)
+
+    if "creacion" in cols:
+        fecha_col = "creacion"
+    elif "fecha_creacion" in cols:
+        fecha_col = "fecha_creacion"
+    elif "fecha_hora" in cols:
+        fecha_col = "fecha_hora"
+    else:
+        return "lote ASC, nro_serie ASC"
+
+    return f"""
+        CASE
+            WHEN NULLIF(BTRIM({fecha_col}::text), '') ~ '^\d{{4}}-\d{{2}}-\d{{2}}'
+                THEN LEFT(BTRIM({fecha_col}::text), 10)::date
+            WHEN NULLIF(BTRIM({fecha_col}::text), '') ~ '^\d{{2}}/\d{{2}}/\d{{4}}'
+                THEN TO_DATE(LEFT(BTRIM({fecha_col}::text), 10), 'DD/MM/YYYY')
+            ELSE NULL
+        END ASC NULLS LAST,
+        nro_serie ASC
+    """
 
 
 def set_status(text: str):
     global status_text
+
     if status_text is None:
         return
 
@@ -45,16 +116,19 @@ def set_status(text: str):
 
 def append_status(text: str):
     global status_text
+
     if status_text is None:
         return
 
     current = status_text.get("1.0", "end-1c").strip()
 
     status_text.configure(state="normal")
+
     if current:
         status_text.insert("end", "\n" + str(text))
     else:
         status_text.insert("end", str(text))
+
     status_text.see("end")
     status_text.configure(state="disabled")
 
@@ -65,17 +139,42 @@ def append_status(text: str):
 def get_app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
+
     return os.path.dirname(os.path.abspath(__file__))
 
 
 APP_DIR = get_app_dir()
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
+LAST_USUARIO_AJUSTE_FILE = os.path.join(APP_DIR, "ultimo_usuario_ajuste.txt")
+
+
+def load_last_usuario_ajuste():
+    try:
+        if os.path.exists(LAST_USUARIO_AJUSTE_FILE):
+            with open(LAST_USUARIO_AJUSTE_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def save_last_usuario_ajuste(usuario: str):
+    try:
+        usuario = str(usuario or "").strip()
+
+        if usuario:
+            with open(LAST_USUARIO_AJUSTE_FILE, "w", encoding="utf-8") as f:
+                f.write(usuario)
+    except Exception:
+        pass
+
 
 DEFAULT_PG = {
     "host": "10.242.4.13",
     "port": 5432,
-    "dbname": "stock_copia",
+    "dbname": "stock",
     "user": "postgres",
     "password": "Talca2025",
     "client_encoding": "WIN1252",
@@ -83,7 +182,6 @@ DEFAULT_PG = {
     "table_products": "productos",
     "table_stock": "stock",
     "table_bajas": "bajas",
-    "table_sheet": "sheet",
     "table_clients": "clientes",
 }
 
@@ -110,10 +208,12 @@ CLIENTES_INICIALES = [
 # =======================
 #   GOOGLE SHEET WEBAPP
 # =======================
+# Dejo el mismo WebApp que usaste en escaner.py.
+# Si en config.json tenés otra URL en "sheet.webapp_url", esa URL tiene prioridad.
 SHEETS_WEBAPP_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbwwzMiTB7DEbcOdvi5Vl32xF-McguAlgkzcBQoeAGhzlowc5J1PjF1QLChNcukf5fbn/exec"
+    "https://script.google.com/macros/s/AKfycbwWisnYakHygj12AhHTggRS2ugLDV5jXmxPYiQsdvVUwCkCEjLZySXYpMa1hQhpSUSJ/exec"
 )
+
 SHEETS_API_KEY = "TALCA-QR-2026"
 
 
@@ -122,9 +222,12 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+
             return data if isinstance(data, dict) else {}
+
         except Exception:
             return {}
+
     return {}
 
 
@@ -148,38 +251,22 @@ def get_pg_config():
 def get_sheet_settings():
     data = load_config()
     sheet = data.get("sheet") if isinstance(data.get("sheet"), dict) else {}
+
     url = sheet.get("webapp_url") or SHEETS_WEBAPP_URL
     api_key = sheet.get("api_key") or SHEETS_API_KEY
+
     return url, api_key
 
 
 def get_email_settings():
-    """
-    Para que el mail salga realmente, agregá esto en config.json:
-
-    {
-      "email": {
-        "smtp_host": "smtp.office365.com",
-        "smtp_port": 587,
-        "smtp_user": "usuario@talca.com",
-        "smtp_password": "CLAVE_DEL_CORREO",
-        "from": "usuario@talca.com",
-        "to": "psantes@talca.com",
-        "use_tls": true
-      }
-    }
-    """
-    data = load_config()
-    email = data.get("email") if isinstance(data.get("email"), dict) else {}
-
     return {
-        "smtp_host": email.get("smtp_host") or email.get("host"),
-        "smtp_port": int(email.get("smtp_port") or email.get("port") or 587),
-        "smtp_user": email.get("smtp_user") or email.get("user"),
-        "smtp_password": email.get("smtp_password") or email.get("password"),
-        "from": email.get("from") or email.get("from_addr") or email.get("smtp_user") or email.get("user"),
-        "to": email.get("to") or EMAIL_AJUSTES_TO,
-        "use_tls": bool(email.get("use_tls", True)),
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_user": "pasantes@talca.com.ar",       # 👈 tu Gmail
+        "smtp_password": "iguc wjzp bfos nbei",    # 👈 App Password (16 chars, con espacios)
+        "from": "pasantes@talca.com.ar",
+        "to": "pasantes@talca.com.ar, logistica@talca.com.ar",           # 👈 quien recibe el aviso
+        "use_tls": True
     }
 
 
@@ -194,6 +281,7 @@ def normalize_client_key(nombre: str) -> str:
     nombre = normalize_client_name(nombre)
     nombre = unicodedata.normalize("NFKD", nombre)
     nombre = "".join(ch for ch in nombre if not unicodedata.combining(ch))
+
     return nombre.casefold()
 
 
@@ -201,6 +289,7 @@ def get_clientes(conn):
     cfg = get_pg_config()
     schema = cfg["schema"]
     tclients = cfg["table_clients"]
+    tusuarios_ajuste = "usuarios_ajuste"
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -209,6 +298,7 @@ def get_clientes(conn):
             WHERE activo = TRUE
             ORDER BY nombre_normalizado ASC, nombre ASC;
         """)
+
         return [str(r[0]).strip() for r in cur.fetchall()]
 
 
@@ -218,6 +308,7 @@ def ensure_cliente_exists(conn, nombre_cliente: str):
     tclients = cfg["table_clients"]
 
     nombre = normalize_client_name(nombre_cliente)
+
     if not nombre:
         raise ValueError("Cliente vacío.")
 
@@ -230,6 +321,7 @@ def ensure_cliente_exists(conn, nombre_cliente: str):
             WHERE nombre_normalizado = %s
             LIMIT 1;
         """, (nombre_normalizado,))
+
         row = cur.fetchone()
 
         if row:
@@ -253,6 +345,7 @@ def ensure_cliente_exists(conn, nombre_cliente: str):
         """, (nombre, nombre_normalizado))
 
         new_row = cur.fetchone()
+
         return int(new_row[0]), str(new_row[1]).strip(), True
 
 
@@ -264,6 +357,7 @@ def pg_connect():
         raise RuntimeError("Falta psycopg2. Instalá con: pip install psycopg2-binary")
 
     cfg = get_pg_config()
+
     conn = psycopg2.connect(
         host=cfg["host"],
         port=cfg["port"],
@@ -271,6 +365,7 @@ def pg_connect():
         user=cfg["user"],
         password=cfg["password"],
     )
+
     conn.autocommit = True
 
     enc = cfg.get("client_encoding")
@@ -285,6 +380,7 @@ def init_tables(conn):
     schema = cfg["schema"]
     tbajas = cfg["table_bajas"]
     tclients = cfg["table_clients"]
+    tusuarios_ajuste = "usuarios_ajuste"
 
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema};")
@@ -379,9 +475,30 @@ def init_tables(conn):
             END $$;
         """)
 
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {schema}.{tusuarios_ajuste} (
+                id SERIAL PRIMARY KEY,
+                usuario TEXT NOT NULL UNIQUE,
+                contrasena TEXT NOT NULL,
+                activo BOOLEAN NOT NULL DEFAULT TRUE,
+                fecha_alta TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        cur.execute(f"""
+            INSERT INTO {schema}.{tusuarios_ajuste} (usuario, contrasena, activo)
+            VALUES
+                ('Ariel Garro', 'Talca2026**', TRUE),
+                ('Carlos Bagnardi', 'Talca2026*', TRUE)
+            ON CONFLICT (usuario) DO UPDATE
+            SET contrasena = EXCLUDED.contrasena,
+                activo = TRUE;
+        """)
+
         for nombre in CLIENTES_INICIALES:
             nombre_limpio = normalize_client_name(nombre)
             nombre_norm = normalize_client_key(nombre_limpio)
+
             cur.execute(f"""
                 INSERT INTO {schema}.{tclients} (nombre, nombre_normalizado, activo, fecha_alta)
                 VALUES (%s, %s, TRUE, NOW())
@@ -389,11 +506,49 @@ def init_tables(conn):
             """, (nombre_limpio, nombre_norm))
 
 
+def autenticar_usuario_ajuste(conn, usuario: str, contrasena: str):
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tusuarios = "usuarios_ajuste"
+
+    usuario = str(usuario or "").strip()
+    contrasena = str(contrasena or "")
+
+    if not usuario or not contrasena:
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT usuario
+            FROM {schema}.{tusuarios}
+            WHERE LOWER(BTRIM(usuario)) = LOWER(BTRIM(%s))
+              AND contrasena = %s
+              AND activo = TRUE
+            LIMIT 1;
+        """, (usuario, contrasena))
+
+        row = cur.fetchone()
+
+    if row and row[0]:
+        return str(row[0]).strip()
+
+    return None
+
+
 # =======================
-#   GOOGLE SHEET SYNC
+#   GOOGLE SHEET SYNC AUTOMÁTICO
 # =======================
+def _looks_like_unknown_action(res) -> bool:
+    try:
+        err = str(res.get("error", "")).lower()
+        return "unknown action" in err
+    except Exception:
+        return False
+
+
 def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
     url, _ = get_sheet_settings()
+
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     req = urllib.request.Request(
@@ -406,10 +561,14 @@ def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             txt = resp.read().decode("utf-8", errors="ignore")
+
             try:
                 return json.loads(txt)
             except Exception:
-                return {"ok": False, "raw": txt}
+                return {
+                    "ok": False,
+                    "raw": txt
+                }
 
     except urllib.error.HTTPError as e:
         try:
@@ -424,45 +583,248 @@ def _post_json_to_webapp(payload: dict, timeout: int = 30) -> dict:
             "raw": body,
         }
 
+    except urllib.error.URLError as e:
+        return {
+            "ok": False,
+            "error": f"URLError: {e}"
+        }
+
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {
+            "ok": False,
+            "error": str(e)
+        }
 
 
-def send_update_row_to_sheet(id_producto: int, descripcion: str, pallets: int, packs: int) -> dict:
+def fetch_all_sheet_rows(conn):
+    """
+    Arma las filas para enviar al Google Sheet leyendo directamente desde produccion.stock.
+
+    No usa produccion.sheet.
+    No necesita que exista produccion.sheet.
+
+    stock_pallets = cantidad real de registros por producto en produccion.stock.
+    stock_packs = suma de packs registrados por producto.
+    """
+
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+    tprod = cfg["table_products"]
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                p.id AS codigo,
+                p.descripcion,
+                COALESCE(st.stock_pallets, 0) AS stock_pallets,
+                COALESCE(st.stock_packs, 0) AS stock_packs
+            FROM {schema}.{tprod} p
+            LEFT JOIN (
+                SELECT
+                    id_producto,
+                    COUNT(*) AS stock_pallets,
+                    SUM(COALESCE(packs, 0)) AS stock_packs
+                FROM {schema}.{tstock}
+                GROUP BY id_producto
+            ) st ON st.id_producto = p.id
+            ORDER BY p.id;
+        """)
+
+        rows = cur.fetchall()
+        out = []
+
+        for codigo, desc, pallets, packs in rows:
+            pallets_val = int(pallets or 0)
+            packs_val = int(packs or 0)
+
+            out.append({
+                "codigo": int(codigo),
+                "id_producto": int(codigo),
+                "descripcion": str(desc).strip(),
+                "stock_pallets": pallets_val,
+                "stock_packs": packs_val,
+                "pallet": pallets_val,
+                "bulto": packs_val,
+            })
+
+        return out
+
+
+def send_bulk_to_sheet(rows, chunk_size: int = 500):
     _, api_key = get_sheet_settings()
 
-    pallets_val = int(pallets or 0)
-    packs_val = int(packs or 0)
+    if rows is None:
+        rows = []
 
-    payload = {
-        "api_key": api_key,
-        "action": "scan_pp",
-        "type": "scan_pp",
-        "codigo": int(id_producto),
-        "id_producto": int(id_producto),
-        "descripcion": str(descripcion),
-        "stock_pallets": pallets_val,
-        "stock_packs": packs_val,
-        "pallet": pallets_val,
-        "bulto": packs_val,
+    total = len(rows)
+    snapshot_id = str(uuid.uuid4())
+    wrote_total = 0
+    blocks = 0
+
+    if total == 0:
+        payload = {
+            "api_key": api_key,
+            "action": "bulk_snapshot_pp",
+            "type": "bulk_snapshot_pp",
+            "snapshot_id": snapshot_id,
+            "block_index": 0,
+            "is_first_block": True,
+            "is_last_block": True,
+            "rows": []
+        }
+
+        return _post_json_to_webapp(payload, timeout=30)
+
+    for start in range(0, total, chunk_size):
+        chunk = rows[start:start + chunk_size]
+        block_index = start // chunk_size
+        blocks += 1
+
+        payload = {
+            "api_key": api_key,
+            "action": "bulk_snapshot_pp",
+            "type": "bulk_snapshot_pp",
+            "snapshot_id": snapshot_id,
+            "block_index": block_index,
+            "is_first_block": start == 0,
+            "is_last_block": start + chunk_size >= total,
+            "rows": chunk
+        }
+
+        res = _post_json_to_webapp(payload, timeout=90)
+
+        if not (isinstance(res, dict) and res.get("ok") is True):
+            if isinstance(res, dict) and _looks_like_unknown_action(res):
+                payload_old = {
+                    "api_key": api_key,
+                    "type": "bulk",
+                    "rows": rows
+                }
+
+                res_old = _post_json_to_webapp(payload_old, timeout=60)
+
+                if isinstance(res_old, dict) and res_old.get("ok") is True:
+                    return {
+                        "ok": True,
+                        "mode": "bulk",
+                        "updated": res_old.get("updated"),
+                        "last_response": res_old
+                    }
+
+                return res_old
+
+            return {
+                "ok": False,
+                "error": "bulk_snapshot_pp failed",
+                "detail": res
+            }
+
+        wrote_total += int(res.get("wrote") or 0)
+
+    return {
+        "ok": True,
+        "mode": "bulk_snapshot_pp",
+        "snapshot_id": snapshot_id,
+        "blocks": blocks,
+        "wrote_total": wrote_total
     }
 
-    return _post_json_to_webapp(payload, timeout=20)
+
+_bulk_sync_timer = None
+_bulk_sync_lock = threading.Lock()
 
 
-def _sync_google_stock_async(id_producto: int, desc: str, net_pallets: int, net_packs: int):
-    def _worker():
-        warn = ""
+def auto_sync_bulk_debounced(on_warn=None, delay_seconds: float = 3.0):
+    """
+    Sincroniza automáticamente el Google Sheet después de cambios en stock.
+
+    Usa debounce: si se hacen varios cambios seguidos, espera unos segundos
+    y manda un solo snapshot completo al Sheet.
+    """
+
+    global _bulk_sync_timer
+
+    def _notify(msg: str):
+        if on_warn is None:
+            return
+
         try:
-            res = send_update_row_to_sheet(id_producto, desc, net_pallets, net_packs)
-            if not (isinstance(res, dict) and res.get("ok") is True):
-                warn = f"⚠️ Google Sheet no confirmó OK: {res}"
-        except Exception as e:
-            warn = f"⚠️ Error al sync con Google Sheet: {e}"
+            if root is not None:
+                root.after(0, lambda: on_warn(msg))
+            else:
+                on_warn(msg)
+        except Exception:
+            pass
 
-        if warn and root is not None:
+    def _run():
+        conn_sync = None
+
+        try:
+            conn_sync = pg_connect()
+            rows = fetch_all_sheet_rows(conn_sync)
+            res = send_bulk_to_sheet(rows)
+
+            if not (isinstance(res, dict) and res.get("ok") is True):
+                _notify(f"⚠️ Auto-sync Sheet: respuesta inválida: {res}")
+
+        except Exception as e:
+            _notify(f"⚠️ Auto-sync Sheet error: {e}")
+
+        finally:
             try:
-                root.after(0, lambda: append_status(warn))
+                if conn_sync is not None:
+                    conn_sync.close()
+            except Exception:
+                pass
+
+    with _bulk_sync_lock:
+        if _bulk_sync_timer is not None:
+            _bulk_sync_timer.cancel()
+
+        _bulk_sync_timer = threading.Timer(delay_seconds, _run)
+        _bulk_sync_timer.daemon = True
+        _bulk_sync_timer.start()
+
+
+def sync_sheet_now_async(on_done=None):
+    """
+    Sincroniza el Google Sheet inmediatamente en segundo plano
+    y deja un mensaje visible indicando si salió bien o si falló.
+    """
+
+    def _worker():
+        conn_sync = None
+
+        try:
+            conn_sync = pg_connect()
+            rows = fetch_all_sheet_rows(conn_sync)
+            res = send_bulk_to_sheet(rows)
+
+            if isinstance(res, dict) and res.get("ok") is True:
+                msg = "✅ Google Sheet sincronizado correctamente."
+            else:
+                msg = f"⚠️ Google Sheet no se sincronizó correctamente: {res}"
+
+        except Exception as e:
+            msg = f"⚠️ Error sincronizando Google Sheet: {e}"
+
+        finally:
+            try:
+                if conn_sync is not None:
+                    conn_sync.close()
+            except Exception:
+                pass
+
+        if root is not None:
+            try:
+                root.after(0, lambda: append_status(msg))
+            except Exception:
+                pass
+
+        if on_done:
+            try:
+                on_done(msg)
             except Exception:
                 pass
 
@@ -475,10 +837,15 @@ def _sync_google_stock_async(id_producto: int, desc: str, net_pallets: int, net_
 def build_stock_changes_email_body(cambios: list[dict]) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
+    usuario_ajuste = "No identificado"
+    if cambios:
+        usuario_ajuste = str(cambios[0].get("usuario_ajuste") or "No identificado")
+
     lines = [
         "Se realizaron ajustes de stock desde el sistema de bajas de Talca.",
         "",
         f"Fecha y hora: {now}",
+        f"Usuario que realizó el ajuste: {usuario_ajuste}",
         f"Cantidad de productos modificados: {len(cambios)}",
         "",
         "Detalle de cambios:",
@@ -492,10 +859,11 @@ def build_stock_changes_email_body(cambios: list[dict]) -> str:
         lines.append(f"Diferencia: {format_diff(c['diff_pallets'], c['diff_packs'])}")
 
         bajas_ids = c.get("bajas_ids") or []
+
         if bajas_ids:
-            lines.append(f"Bajas registradas: {', '.join(str(x) for x in bajas_ids)}")
+            lines.append(f"IDs de bajas generadas: {format_bajas_ids(bajas_ids)}")
         else:
-            lines.append("Bajas registradas: No corresponde")
+            lines.append("IDs de bajas generadas: No corresponde")
 
         lines.append("-" * 60)
 
@@ -513,14 +881,25 @@ def send_stock_changes_email(cambios: list[dict]):
     to_addr = settings["to"]
     use_tls = settings["use_tls"]
 
-    if not host or not user or not password or not from_addr or not to_addr:
+    if (
+        not host
+        or not user
+        or not password
+        or password in ("PONER_ACA_LA_CLAVE_REAL_DEL_CORREO", "PONER_ACA_LA_CLAVE_DE_APLICACION")
+        or not from_addr
+        or not to_addr
+    ):
         raise ValueError(
-            "Falta configurar el email en config.json. "
-            "Necesitás smtp_host, smtp_user, smtp_password, from y to."
+            "Falta configurar la clave real del correo. "
+            "Completá EMAIL_SMTP_PASSWORD o configurá la variable de entorno TALCA_EMAIL_PASSWORD."
         )
 
+    usuario_ajuste = "No identificado"
+    if cambios:
+        usuario_ajuste = str(cambios[0].get("usuario_ajuste") or "No identificado")
+
     msg = EmailMessage()
-    msg["Subject"] = f"Ajustes de stock Talca - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    msg["Subject"] = f"Ajustes de stock Talca - {usuario_ajuste} - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     msg["From"] = from_addr
     msg["To"] = to_addr
     msg.set_content(build_stock_changes_email_body(cambios))
@@ -528,6 +907,7 @@ def send_stock_changes_email(cambios: list[dict]):
     with smtplib.SMTP(host, port, timeout=30) as smtp:
         if use_tls:
             smtp.starttls()
+
         smtp.login(user, password)
         smtp.send_message(msg)
 
@@ -537,6 +917,7 @@ def send_stock_changes_email_async(cambios: list[dict]):
         try:
             send_stock_changes_email(cambios)
             msg = f"📧 Mail enviado correctamente a {EMAIL_AJUSTES_TO}."
+
         except Exception as e:
             msg = f"⚠️ No se pudo enviar el mail de ajustes: {e}"
 
@@ -576,6 +957,7 @@ def get_products_with_stock(conn):
             )
             ORDER BY p.id ASC;
         """)
+
         return cur.fetchall()
 
 
@@ -626,14 +1008,17 @@ def get_stock_summary_by_product(conn):
                 ), 0) > 0
             ORDER BY p.id ASC;
         """)
+
         rows = cur.fetchall()
 
     result = []
+
     for row in rows:
         pid = int(row[0])
         desc = str(row[1]).strip() if row[1] else "Sin descripción"
         pallets = int(row[2] or 0)
         packs = int(row[3] or 0)
+
         result.append((pid, desc, pallets, packs))
 
     return result
@@ -670,14 +1055,17 @@ def get_stock_summary_all_products(conn):
             GROUP BY p.id, p.descripcion
             ORDER BY p.id ASC;
         """)
+
         rows = cur.fetchall()
 
     result = []
+
     for row in rows:
         pid = int(row[0])
         desc = str(row[1]).strip() if row[1] else "Sin descripción"
         pallets = int(row[2] or 0)
         packs = int(row[3] or 0)
+
         result.append((pid, desc, pallets, packs))
 
     return result
@@ -693,6 +1081,8 @@ def get_lotes_for_product(conn, id_producto: int):
             SELECT DISTINCT lote
             FROM {schema}.{tstock}
             WHERE id_producto = %s
+              AND UPPER(BTRIM(COALESCE(lote::text, ''))) <> 'AJUSTE'
+              AND BTRIM(COALESCE(lote::text, '')) <> ''
               AND (
                     UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
                     OR (
@@ -702,6 +1092,7 @@ def get_lotes_for_product(conn, id_producto: int):
               )
             ORDER BY lote ASC;
         """, (int(id_producto),))
+
         return [r[0] for r in cur.fetchall()]
 
 
@@ -731,8 +1122,62 @@ def compute_net_available_lote(conn, id_producto: int, lote: str):
             WHERE id_producto = %s
               AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s);
         """, (int(id_producto), str(lote)))
+
         row = cur.fetchone()
+
         return int(row[0] or 0), int(row[1] or 0)
+
+
+def get_stock_disponible_lote_tipo(conn, id_producto: int, lote: str, tipo_unidad: str):
+    """
+    Devuelve cuánto stock real hay disponible para dar de baja
+    según producto + lote + tipo.
+
+    PALLET: cuenta registros reales en produccion.stock.
+    PACKS: suma la columna packs de los registros tipo PACKS.
+    """
+
+    cfg = get_pg_config()
+    schema = cfg["schema"]
+    tstock = cfg["table_stock"]
+
+    tipo_unidad = str(tipo_unidad or "").upper().strip()
+
+    with conn.cursor() as cur:
+        if tipo_unidad in ("PALLET", "PALLETS"):
+            cur.execute(f"""
+                SELECT COUNT(*)
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                  AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s)
+                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS');
+            """, (int(id_producto), str(lote)))
+
+        elif tipo_unidad == "PACKS":
+            cur.execute(f"""
+                SELECT COALESCE(SUM(COALESCE(packs, 0)), 0)
+                FROM {schema}.{tstock}
+                WHERE id_producto = %s
+                  AND BTRIM(COALESCE(lote::text, '')) = BTRIM(%s)
+                  AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
+                  AND COALESCE(packs, 0) > 0;
+            """, (int(id_producto), str(lote)))
+
+        else:
+            return 0
+
+        row = cur.fetchone()
+
+    return int(row[0] or 0)
+
+
+def get_stock_disponible_lote_resumen(conn, id_producto: int, lote: str):
+    """
+    Devuelve pallets y packs disponibles en stock para mostrar en pantalla.
+    """
+
+    pallets, packs = compute_net_available_lote(conn, id_producto, lote)
+    return int(pallets or 0), int(packs or 0)
 
 
 def get_product_net_stock(conn, id_producto: int):
@@ -773,24 +1218,17 @@ def get_product_net_stock(conn, id_producto: int):
         return "Sin descripción", 0, 0
 
 
-def upsert_sheet(conn, id_producto: int, stock_pallets: int, stock_packs: int):
-    cfg = get_pg_config()
-    schema = cfg["schema"]
-    tsheet = cfg["table_sheet"]
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            INSERT INTO {schema}.{tsheet}(id_producto, stock_pallets, stock_packs)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (id_producto)
-            DO UPDATE SET stock_pallets = EXCLUDED.stock_pallets,
-                          stock_packs   = EXCLUDED.stock_packs;
-        """, (int(id_producto), int(stock_pallets), int(stock_packs)))
-
-
-def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str,
-                   observaciones: str = None, tipo_unidad: str = None,
-                   cliente: str = None, id_cliente: int = None):
+def registrar_baja(
+    conn,
+    id_producto: int,
+    lote: str,
+    cantidad: int,
+    motivo: str,
+    observaciones: str = None,
+    tipo_unidad: str = None,
+    cliente: str = None,
+    id_cliente: int = None
+):
     cfg = get_pg_config()
     schema = cfg["schema"]
     tbajas = cfg["table_bajas"]
@@ -818,6 +1256,78 @@ def registrar_baja(conn, id_producto: int, lote: str, cantidad: int, motivo: str
         return cur.fetchone()[0]
 
 
+def registrar_bajas_individuales(
+    conn,
+    id_producto: int,
+    lote: str,
+    cantidad: int,
+    motivo: str,
+    observaciones: str = None,
+    tipo_unidad: str = None,
+    cliente: str = None,
+    id_cliente: int = None,
+    detalles: list = None
+):
+    """
+    Registra una fila por cada unidad dada de baja.
+    Cada fila queda con cantidad = 1 y conserva la observación escrita por el usuario.
+
+    Ejemplo:
+    cantidad = 5 pallets -> genera 5 filas en produccion.bajas, cada una con cantidad = 1.
+    """
+
+    cantidad = int(cantidad)
+
+    if cantidad <= 0:
+        return []
+
+    ids_generados = []
+    detalles = detalles or []
+    obs_base = str(observaciones or "").strip()
+
+    for i in range(cantidad):
+        partes_obs = []
+
+        if obs_base:
+            partes_obs.append(f"Observación usuario: {obs_base}")
+
+        partes_obs.append(f"Registro individual {i + 1}/{cantidad}")
+
+        if i < len(detalles):
+            partes_obs.append(f"Detalle stock: {detalles[i]}")
+
+        obs_individual = " | ".join(partes_obs)
+
+        baja_id = registrar_baja(
+            conn=conn,
+            id_producto=id_producto,
+            lote=lote,
+            cantidad=1,
+            motivo=motivo,
+            observaciones=obs_individual,
+            tipo_unidad=tipo_unidad,
+            cliente=cliente,
+            id_cliente=id_cliente
+        )
+
+        ids_generados.append(baja_id)
+
+    return ids_generados
+
+
+def format_bajas_ids(ids, limite=20):
+    ids = ids or []
+
+    if not ids:
+        return "No corresponde"
+
+    if len(ids) <= limite:
+        return ", ".join(str(x) for x in ids)
+
+    primeros = ", ".join(str(x) for x in ids[:limite])
+    return f"{primeros}, ... ({len(ids)} registros en total)"
+
+
 # =======================
 #   STOCK LOW LEVEL
 # =======================
@@ -832,6 +1342,7 @@ def get_next_nro_serie(conn, id_producto: int):
             FROM {schema}.{tstock}
             WHERE id_producto = %s;
         """, (int(id_producto),))
+
         row = cur.fetchone()
 
     return int(row[0] or 0) + 1
@@ -850,6 +1361,7 @@ def get_lote_para_alta(conn, id_producto: int):
             ORDER BY nro_serie DESC NULLS LAST
             LIMIT 1;
         """, (int(id_producto),))
+
         row = cur.fetchone()
 
     if row and row[0]:
@@ -858,8 +1370,7 @@ def get_lote_para_alta(conn, id_producto: int):
     return LOTE_AJUSTE_DEFAULT
 
 
-def insert_stock_adjustment_records(conn, id_producto: int, lote: str,
-                                    tipo_unidad: str, cantidad: int):
+def insert_stock_adjustment_records(conn, id_producto: int, lote: str, tipo_unidad: str, cantidad: int):
     cfg = get_pg_config()
     schema = cfg["schema"]
     tstock = cfg["table_stock"]
@@ -867,31 +1378,62 @@ def insert_stock_adjustment_records(conn, id_producto: int, lote: str,
     pid = int(id_producto)
     cantidad = int(cantidad)
     tipo_unidad = str(tipo_unidad).upper().strip()
-    lote = str(lote or LOTE_AJUSTE_DEFAULT).strip() or LOTE_AJUSTE_DEFAULT
+
+    lote_ajuste, fecha_creacion, fecha_vencimiento = get_datos_alta_ajuste()
+    lote = lote_ajuste
 
     if cantidad <= 0:
         return []
 
     inserted = []
     next_serie = get_next_nro_serie(conn, pid)
+    stock_cols = get_table_columns(conn, schema, tstock)
+
+    def insert_row(cur, nro_serie, packs_value):
+        # IMPORTANTE:
+        # En la BD de Talca, la columna packs no permite NULL.
+        # Por eso, cuando se agrega un PALLET, se guarda packs = 0.
+        # Cuando se agrega PACKS, se guarda la cantidad correspondiente.
+        packs_db = 0 if packs_value is None else int(packs_value)
+
+        cols = ["id_producto", "lote", "tipo_unidad", "nro_serie", "packs"]
+        vals = [pid, lote, tipo_unidad, nro_serie, packs_db]
+
+        if "creacion" in stock_cols:
+            cols.append("creacion")
+            vals.append(fecha_creacion)
+        elif "fecha_creacion" in stock_cols:
+            cols.append("fecha_creacion")
+            vals.append(fecha_creacion)
+
+        if "vencimiento" in stock_cols:
+            cols.append("vencimiento")
+            vals.append(fecha_vencimiento)
+        elif "fecha_vencimiento" in stock_cols:
+            cols.append("fecha_vencimiento")
+            vals.append(fecha_vencimiento)
+
+        if "fecha_hora" in stock_cols:
+            cols.append("fecha_hora")
+            vals.append(datetime.now())
+
+        placeholders = ", ".join(["%s"] * len(cols))
+        cols_sql = ", ".join(cols)
+
+        cur.execute(f"""
+            INSERT INTO {schema}.{tstock} ({cols_sql})
+            VALUES ({placeholders});
+        """, vals)
 
     with conn.cursor() as cur:
         if tipo_unidad == "PALLET":
             for i in range(cantidad):
                 nro_serie = next_serie + i
-                cur.execute(f"""
-                    INSERT INTO {schema}.{tstock}
-                        (id_producto, lote, tipo_unidad, nro_serie, packs)
-                    VALUES (%s, %s, 'PALLET', %s, NULL);
-                """, (pid, lote, nro_serie))
+                insert_row(cur, nro_serie, 0)
                 inserted.append(str(nro_serie))
 
         elif tipo_unidad == "PACKS":
-            cur.execute(f"""
-                INSERT INTO {schema}.{tstock}
-                    (id_producto, lote, tipo_unidad, nro_serie, packs)
-                VALUES (%s, %s, 'PACKS', %s, %s);
-            """, (pid, lote, next_serie, cantidad))
+            insert_row(cur, next_serie, cantidad)
             inserted.append(f"{next_serie} (+{cantidad} packs)")
 
         else:
@@ -962,6 +1504,7 @@ def delete_from_stock_iterative(conn, id_producto: int, lote: str, tipo_unidad: 
                     break
 
                 packs_val = int(packs_val or 0)
+
                 if packs_val <= 0:
                     continue
 
@@ -1008,6 +1551,7 @@ def delete_from_stock_general_iterative(conn, id_producto: int, tipo_unidad: str
     cantidad = int(cantidad)
     afectadas = []
     bajas_por_lote = {}
+    order_expr = get_stock_oldest_order_expr(conn, schema, tstock)
 
     def add_lote_qty(lote_value, qty):
         lote_txt = str(lote_value or "SIN LOTE").strip() or "SIN LOTE"
@@ -1020,7 +1564,7 @@ def delete_from_stock_general_iterative(conn, id_producto: int, tipo_unidad: str
                 FROM {schema}.{tstock}
                 WHERE id_producto = %s
                   AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) IN ('PALLET', 'PALLETS')
-                ORDER BY lote ASC, nro_serie ASC
+                ORDER BY {order_expr}
                 LIMIT %s
                 FOR UPDATE;
             """, (int(id_producto), int(cantidad)))
@@ -1049,7 +1593,7 @@ def delete_from_stock_general_iterative(conn, id_producto: int, tipo_unidad: str
                 WHERE id_producto = %s
                   AND UPPER(BTRIM(COALESCE(tipo_unidad, ''))) = 'PACKS'
                   AND COALESCE(packs, 0) > 0
-                ORDER BY lote ASC, nro_serie ASC
+                ORDER BY {order_expr}
                 FOR UPDATE;
             """, (int(id_producto),))
 
@@ -1065,6 +1609,7 @@ def delete_from_stock_general_iterative(conn, id_producto: int, tipo_unidad: str
                     break
 
                 packs_val = int(packs_val or 0)
+
                 if packs_val <= 0:
                     continue
 
@@ -1123,7 +1668,7 @@ def format_diff(diff_pallets: int, diff_packs: int) -> str:
     return " | ".join(parts) if parts else "Sin cambios"
 
 
-def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
+def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict, usuario_ajuste: str = None) -> dict:
     pid = int(cambio["id_producto"])
     nuevo_pallets = int(cambio["nuevo_pallets"])
     nuevo_packs = int(cambio["nuevo_packs"])
@@ -1137,6 +1682,9 @@ def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
     diff_packs = nuevo_packs - packs_antes
 
     bajas_ids = []
+    fecha_ajuste_txt = datetime.now().strftime("%d/%m/%Y")
+    usuario_txt = str(usuario_ajuste or "usuario no identificado").strip()
+    motivo_baja_ajuste = f"Baja por ajuste de stock {fecha_ajuste_txt} por {usuario_txt}"
 
     if diff_pallets == 0 and diff_packs == 0:
         return {
@@ -1149,6 +1697,7 @@ def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
             "diff_pallets": 0,
             "diff_packs": 0,
             "bajas_ids": [],
+            "usuario_ajuste": usuario_txt,
             "sin_cambios": True,
         }
 
@@ -1158,7 +1707,7 @@ def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
         insert_stock_adjustment_records(conn, pid, lote_alta, "PALLET", diff_pallets)
 
     elif diff_pallets < 0:
-        _, bajas_por_lote = delete_from_stock_general_iterative(
+        series_afectadas, bajas_por_lote = delete_from_stock_general_iterative(
             conn,
             pid,
             "PALLET",
@@ -1166,22 +1715,28 @@ def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
         )
 
         for lote, qty in bajas_por_lote.items():
-            baja_id = registrar_baja(
-                conn,
-                pid,
-                lote,
-                qty,
-                "Ajuste de stock",
-                f"Ajuste administrativo. Stock anterior: {pallets_antes} pallets. Stock nuevo: {nuevo_pallets} pallets.",
-                tipo_unidad="PALLET"
+            ids = registrar_bajas_individuales(
+                conn=conn,
+                id_producto=pid,
+                lote=lote,
+                cantidad=qty,
+                motivo=motivo_baja_ajuste,
+                observaciones=(
+                    f"Ajuste administrativo realizado por {usuario_txt}. "
+                    f"Stock anterior: {pallets_antes} pallets. "
+                    f"Stock nuevo: {nuevo_pallets} pallets."
+                ),
+                tipo_unidad="PALLET",
+                detalles=series_afectadas
             )
-            bajas_ids.append(baja_id)
+
+            bajas_ids.extend(ids)
 
     if diff_packs > 0:
         insert_stock_adjustment_records(conn, pid, lote_alta, "PACKS", diff_packs)
 
     elif diff_packs < 0:
-        _, bajas_por_lote = delete_from_stock_general_iterative(
+        series_afectadas, bajas_por_lote = delete_from_stock_general_iterative(
             conn,
             pid,
             "PACKS",
@@ -1189,19 +1744,24 @@ def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
         )
 
         for lote, qty in bajas_por_lote.items():
-            baja_id = registrar_baja(
-                conn,
-                pid,
-                lote,
-                qty,
-                "Ajuste de stock",
-                f"Ajuste administrativo. Stock anterior: {packs_antes} packs. Stock nuevo: {nuevo_packs} packs.",
-                tipo_unidad="PACKS"
+            ids = registrar_bajas_individuales(
+                conn=conn,
+                id_producto=pid,
+                lote=lote,
+                cantidad=qty,
+                motivo=motivo_baja_ajuste,
+                observaciones=(
+                    f"Ajuste administrativo realizado por {usuario_txt}. "
+                    f"Stock anterior: {packs_antes} packs. "
+                    f"Stock nuevo: {nuevo_packs} packs."
+                ),
+                tipo_unidad="PACKS",
+                detalles=series_afectadas
             )
-            bajas_ids.append(baja_id)
+
+            bajas_ids.extend(ids)
 
     desc_final, pallets_despues, packs_despues = get_product_net_stock(conn, pid)
-    upsert_sheet(conn, pid, pallets_despues, packs_despues)
 
     return {
         "id_producto": pid,
@@ -1213,15 +1773,17 @@ def aplicar_ajuste_producto_en_transaccion(conn, cambio: dict) -> dict:
         "diff_pallets": pallets_despues - pallets_antes,
         "diff_packs": packs_despues - packs_antes,
         "bajas_ids": bajas_ids,
+        "usuario_ajuste": usuario_txt,
         "sin_cambios": False,
     }
 
 
-def set_stock_lote(conn, cambios: list[dict]) -> list[dict]:
+def set_stock_lote(conn, cambios: list[dict], usuario_ajuste: str = None) -> list[dict]:
     """
     Aplica todos los ajustes juntos.
     Si uno falla, se hace rollback completo.
     """
+
     if not cambios:
         return []
 
@@ -1232,8 +1794,10 @@ def set_stock_lote(conn, cambios: list[dict]) -> list[dict]:
         conn.autocommit = False
 
         for cambio in cambios:
-            res = aplicar_ajuste_producto_en_transaccion(conn, cambio)
+            res = aplicar_ajuste_producto_en_transaccion(conn, cambio, usuario_ajuste)
+
             if not res.get("sin_cambios"):
+                res["usuario_ajuste"] = str(usuario_ajuste or "No identificado")
                 resultados.append(res)
 
         conn.commit()
@@ -1251,8 +1815,16 @@ def set_stock_lote(conn, cambios: list[dict]) -> list[dict]:
 # =======================
 #   BAJA MANUAL
 # =======================
-def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
-                motivo: str, observaciones: str = None, cliente: str = None):
+def baja_manual(
+    conn,
+    id_producto: int,
+    lote: str,
+    tipo: str,
+    cantidad: int,
+    motivo: str,
+    observaciones: str = None,
+    cliente: str = None
+):
     pid = int(id_producto)
     lote = str(lote).strip()
     tipo = (tipo or "").strip().lower()
@@ -1291,20 +1863,20 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 
         series_afectadas = delete_from_stock_iterative(conn, pid, lote, tipo_unidad, cantidad)
 
-        baja_id = registrar_baja(
-            conn,
-            pid,
-            lote,
-            cantidad,
-            motivo,
-            observaciones,
+        bajas_ids = registrar_bajas_individuales(
+            conn=conn,
+            id_producto=pid,
+            lote=lote,
+            cantidad=cantidad,
+            motivo=motivo,
+            observaciones=observaciones,
             tipo_unidad=tipo_unidad,
             cliente=cliente_final,
-            id_cliente=id_cliente
+            id_cliente=id_cliente,
+            detalles=series_afectadas
         )
 
         desc, net_pallets, net_packs = get_product_net_stock(conn, pid)
-        upsert_sheet(conn, pid, net_pallets, net_packs)
 
         conn.commit()
 
@@ -1315,10 +1887,8 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
     finally:
         conn.autocommit = prev_autocommit
 
-    _sync_google_stock_async(pid, desc, net_pallets, net_packs)
-
     return (
-        baja_id,
+        bajas_ids,
         pid,
         desc,
         lote,
@@ -1335,7 +1905,7 @@ def baja_manual(conn, id_producto: int, lote: str, tipo: str, cantidad: int,
 # =======================
 #   DIALOGO CONTRASEÑA
 # =======================
-def pedir_contrasena(parent) -> bool:
+def pedir_contrasena(parent, conn):
     dialog = tk.Toplevel(parent)
     dialog.title("Acceso restringido")
     dialog.resizable(False, False)
@@ -1345,69 +1915,147 @@ def pedir_contrasena(parent) -> bool:
     parent.update_idletasks()
     px = parent.winfo_x() + parent.winfo_width() // 2
     py = parent.winfo_y() + parent.winfo_height() // 2
-    dialog.geometry(f"380x200+{px - 190}+{py - 100}")
 
-    resultado = {"ok": False}
+    dialog.geometry(f"460x300+{px - 230}+{py - 150}")
 
-    frame = tb.Frame(dialog, padding=24)
+    resultado = {"usuario": None}
+
+    frame = tk.Frame(dialog, bg="white", padx=28, pady=24)
     frame.pack(fill="both", expand=True)
 
-    tb.Label(
+    tk.Label(
         frame,
-        text="🔒  Zona Administrativa",
-        font=("Segoe UI", 13, "bold")
-    ).pack(pady=(0, 6))
+        text="🔒 Zona Administrativa",
+        font=("Segoe UI", 14, "bold"),
+        bg="white",
+        fg="#222222"
+    ).pack(pady=(0, 8))
 
-    tb.Label(
+    tk.Label(
         frame,
-        text="Ingresá la contraseña para continuar:",
-        font=("Segoe UI", 10)
-    ).pack(pady=(0, 10))
+        text="Ingresá usuario y contraseña para continuar:",
+        font=("Segoe UI", 10),
+        bg="white",
+        fg="#333333"
+    ).pack(pady=(0, 14))
 
+    form = tk.Frame(frame, bg="white")
+    form.pack()
+
+    ultimo_usuario = load_last_usuario_ajuste()
+
+    usuario_var = tk.StringVar(value=ultimo_usuario)
     pwd_var = tk.StringVar()
-    pwd_entry = tb.Entry(frame, textvariable=pwd_var, show="*", width=28, font=("Segoe UI", 11))
-    pwd_entry.pack(pady=(0, 6))
-    pwd_entry.focus_set()
 
-    error_label = tb.Label(frame, text="", foreground="red", font=("Segoe UI", 9))
-    error_label.pack()
+    tk.Label(
+        form,
+        text="Usuario:",
+        font=("Segoe UI", 10),
+        bg="white",
+        fg="#222222"
+    ).grid(row=0, column=0, sticky="e", padx=(0, 10), pady=7)
+
+    usuario_entry = tk.Entry(
+        form,
+        textvariable=usuario_var,
+        width=30,
+        font=("Segoe UI", 10),
+        bg="white",
+        fg="black",
+        insertbackground="black",
+        relief="solid",
+        bd=1
+    )
+    usuario_entry.grid(row=0, column=1, sticky="w", pady=7)
+
+    tk.Label(
+        form,
+        text="Contraseña:",
+        font=("Segoe UI", 10),
+        bg="white",
+        fg="#222222"
+    ).grid(row=1, column=0, sticky="e", padx=(0, 10), pady=7)
+
+    pwd_entry = tk.Entry(
+        form,
+        textvariable=pwd_var,
+        show="*",
+        width=30,
+        font=("Segoe UI", 10),
+        bg="white",
+        fg="black",
+        insertbackground="black",
+        relief="solid",
+        bd=1
+    )
+    pwd_entry.grid(row=1, column=1, sticky="w", pady=7)
+
+    if ultimo_usuario:
+        pwd_entry.focus_set()
+    else:
+        usuario_entry.focus_set()
+
+    error_label = tk.Label(
+        frame,
+        text="",
+        fg="#b00020",
+        bg="white",
+        font=("Segoe UI", 9)
+    )
+    error_label.pack(pady=(10, 0))
 
     def confirmar(event=None):
-        if pwd_var.get() == PASSWORD_ADMIN:
-            resultado["ok"] = True
+        usuario_ok = autenticar_usuario_ajuste(conn, usuario_var.get(), pwd_var.get())
+
+        if usuario_ok:
+            resultado["usuario"] = usuario_ok
+            save_last_usuario_ajuste(usuario_ok)
             dialog.destroy()
+
         else:
-            error_label.configure(text="Contraseña incorrecta. Intentá de nuevo.")
+            error_label.configure(text="Usuario o contraseña incorrectos.")
             pwd_var.set("")
             pwd_entry.focus_set()
 
     def cancelar():
         dialog.destroy()
 
-    btn_frame = tb.Frame(frame)
-    btn_frame.pack(pady=(10, 0))
+    btn_frame = tk.Frame(frame, bg="white")
+    btn_frame.pack(pady=(14, 0))
 
-    tb.Button(
+    tk.Button(
         btn_frame,
         text="Ingresar",
-        bootstyle=SUCCESS,
-        width=12,
+        width=13,
+        font=("Segoe UI", 10, "bold"),
+        bg="#198754",
+        fg="white",
+        activebackground="#157347",
+        activeforeground="white",
+        relief="flat",
         command=confirmar
-    ).pack(side="left", padx=6)
+    ).pack(side="left", padx=8)
 
-    tb.Button(
+    tk.Button(
         btn_frame,
         text="Cancelar",
-        bootstyle=SECONDARY,
-        width=12,
+        width=13,
+        font=("Segoe UI", 10, "bold"),
+        bg="#6c757d",
+        fg="white",
+        activebackground="#5c636a",
+        activeforeground="white",
+        relief="flat",
         command=cancelar
-    ).pack(side="left", padx=6)
+    ).pack(side="left", padx=8)
 
+    usuario_entry.bind("<Return>", lambda e: pwd_entry.focus_set())
     pwd_entry.bind("<Return>", confirmar)
+    dialog.bind("<Escape>", lambda e: cancelar())
 
     dialog.wait_window()
-    return resultado["ok"]
 
+    return resultado["usuario"]
 
 # =======================
 #   UI
@@ -1416,11 +2064,12 @@ MOTIVOS = ("Venta", "Calidad", "Desarme", "Observacion")
 
 
 def main():
-    global root, status_text
+    global root, status_text, _bulk_sync_timer
 
     try:
         conn = pg_connect()
         init_tables(conn)
+
     except Exception as e:
         messagebox.showerror("Error PostgreSQL", f"No se pudo conectar:\n{e}")
         return
@@ -1456,7 +2105,7 @@ def main():
 
     notebook.add(tab_bajas, text="Bajas")
     notebook.add(tab_stock, text="Stock actual")
-    notebook.add(tab_editor, text="🔒 Editor de stock")
+    notebook.add(tab_editor, text="🔒 Ajuste de stock")
 
     # =========================================================
     # TAB BAJAS CON SCROLL
@@ -1532,6 +2181,7 @@ def main():
     def refresh_client_combo_values(selected_text=None):
         values = get_clientes(conn)
         cliente_combo["values"] = values
+
         if selected_text is not None:
             cliente_var.set(selected_text)
 
@@ -1539,6 +2189,7 @@ def main():
         if motivo_var.get() == "Venta":
             cliente_label.grid()
             cliente_combo.grid()
+
         else:
             cliente_var.set("")
             cliente_label.grid_remove()
@@ -1584,7 +2235,18 @@ def main():
     )
     lote_combo.grid(row=1, column=1, sticky="w", pady=9)
 
+    disponibilidad_lote_var = tb.StringVar(value="Disponible en stock: -")
+
+    disponibilidad_lote_label = tb.Label(
+        form_wrap,
+        textvariable=disponibilidad_lote_var,
+        font=("Segoe UI", 10, "italic"),
+        foreground="#555555"
+    )
+    disponibilidad_lote_label.grid(row=1, column=2, sticky="w", padx=(18, 0), pady=9)
+
     cliente_label = tb.Label(form_wrap, text="Cliente:", font=("Segoe UI", 11))
+
     cliente_combo = tb.Combobox(
         form_wrap,
         textvariable=cliente_var,
@@ -1592,6 +2254,7 @@ def main():
         width=32,
         state="normal"
     )
+
     cliente_label.grid(row=2, column=0, sticky="e", padx=(0, 14), pady=9)
     cliente_combo.grid(row=2, column=1, sticky="w", pady=9)
 
@@ -1620,14 +2283,24 @@ def main():
         row=4, column=0, sticky="e", padx=(0, 14), pady=9
     )
 
-    cant_entry = tb.Entry(form_wrap, textvariable=cant_var, width=14, font=("Segoe UI", 11))
+    cant_entry = tb.Entry(
+        form_wrap,
+        textvariable=cant_var,
+        width=14,
+        font=("Segoe UI", 11)
+    )
     cant_entry.grid(row=4, column=1, sticky="w", pady=9)
 
     tb.Label(form_wrap, text="Observaciones:", font=("Segoe UI", 11)).grid(
         row=5, column=0, sticky="ne", padx=(0, 14), pady=(9, 0)
     )
 
-    obs_entry = tb.Entry(form_wrap, textvariable=obs_manual_var, width=64, font=("Segoe UI", 11))
+    obs_entry = tb.Entry(
+        form_wrap,
+        textvariable=obs_manual_var,
+        width=64,
+        font=("Segoe UI", 11)
+    )
     obs_entry.grid(row=5, column=1, sticky="w", pady=(9, 0))
 
     actions_frame = tb.Frame(card_baja)
@@ -1658,6 +2331,7 @@ def main():
         yscrollcommand=status_scrollbar.set
     )
     status_text.pack(side="left", fill="both", expand=True)
+
     status_scrollbar.config(command=status_text.yview)
     status_text.configure(state="disabled")
 
@@ -1702,7 +2376,7 @@ def main():
     stock_tree.heading("packs", text="Packs")
 
     stock_tree.column("codigo", width=100, anchor="center")
-    stock_tree.column("descripcion", width=560, anchor="w")
+    stock_tree.column("descripcion", width=560, anchor="center")
     stock_tree.column("pallets", width=120, anchor="center")
     stock_tree.column("packs", width=120, anchor="center")
 
@@ -1746,15 +2420,15 @@ def main():
 
     tb.Label(
         editor_header,
-        text="Editor de stock",
+        text="Ajuste de stock por producto",
         font=("Segoe UI", 18, "bold")
     ).pack(side="left")
 
     btn_enviar_cambios = tb.Button(
         editor_header,
-        text="ENVIAR TODOS LOS CAMBIOS",
+        text="REALIZAR AJUSTE",
         bootstyle=DANGER,
-        width=28
+        width=22
     )
     btn_enviar_cambios.pack(side="right", padx=(6, 0))
 
@@ -1785,8 +2459,10 @@ def main():
     tb.Label(
         editor_frame,
         text=(
-            "Editá directamente en la tabla las columnas 'Pallets nuevos' y 'Packs nuevos' "
-            "con doble clic. Luego enviá todos los cambios juntos."
+            "Se muestran todos los productos con su stock actual. "
+            "En 'Ajuste pallets' y 'Ajuste packs' ingresá la cantidad real total contada. "
+            "Ejemplo: si el sistema dice 10 pallets y en planta hay 6, escribí 6. "
+            "Luego presioná REALIZAR AJUSTE."
         ),
         font=("Segoe UI", 9),
         foreground="gray"
@@ -1818,8 +2494,8 @@ def main():
     editor_tree.heading("descripcion", text="Descripción")
     editor_tree.heading("pallets_actuales", text="Pallets actuales")
     editor_tree.heading("packs_actuales", text="Packs actuales")
-    editor_tree.heading("pallets_nuevos", text="Pallets nuevos")
-    editor_tree.heading("packs_nuevos", text="Packs nuevos")
+    editor_tree.heading("pallets_nuevos", text="Ajuste pallets")
+    editor_tree.heading("packs_nuevos", text="Ajuste packs")
     editor_tree.heading("diferencia", text="Diferencia")
 
     editor_tree.column("codigo", width=80, anchor="center")
@@ -1840,8 +2516,18 @@ def main():
     edit_panel.pack(fill="x", pady=(10, 0))
 
     edit_status_var = tk.StringVar(value="Sin cambios pendientes.")
-    edit_status_label = tb.Label(edit_panel, textvariable=edit_status_var, font=("Segoe UI", 10))
+
+    edit_status_label = tb.Label(
+        edit_panel,
+        textvariable=edit_status_var,
+        font=("Segoe UI", 10)
+    )
     edit_status_label.pack(anchor="w")
+
+    # Guarda qué filas fueron editadas manualmente en Ajuste de stock.
+    # Esto permite que las columnas visualmente vuelvan a 0 después de enviar,
+    # sin que esos 0 se interpreten como "dejar stock real en cero".
+    editor_items_editados = set()
 
     # =========================================================
     # FUNCIONES UI STOCK / EDITOR
@@ -1864,6 +2550,8 @@ def main():
             stock_tree.insert("", "end", values=("-", f"Error al cargar stock: {e}", "-", "-"))
 
     def refresh_editor_tree():
+        editor_items_editados.clear()
+
         for item in editor_tree.get_children():
             editor_tree.delete(item)
 
@@ -1876,16 +2564,21 @@ def main():
 
             for pid, desc, pallets, packs in rows:
                 tag = "con_stock" if (pallets > 0 or packs > 0) else "sin_stock"
+
                 editor_tree.insert(
                     "",
                     "end",
-                    values=(pid, desc, pallets, packs, pallets, packs, "Sin cambios"),
+                    values=(pid, desc, pallets, packs, 0, 0, "Sin cambios"),
                     tags=(tag,)
                 )
 
             editor_tree.tag_configure("con_stock", background="#e8f5e9")
             editor_tree.tag_configure("sin_stock", background="#ffffff")
-            edit_status_var.set("🟢 Stock cargado. Editá con doble clic las columnas de nuevos valores.")
+            editor_tree.tag_configure("modificado", background="#fff3cd")
+            editor_tree.tag_configure("error", background="#f8d7da")
+
+            usuario_msg = f" Usuario: {USUARIO_AJUSTE_ACTUAL}." if USUARIO_AJUSTE_ACTUAL else ""
+            edit_status_var.set("🟢 Stock cargado. Las columnas de ajuste quedan en 0. Hacé clic y escribí el total real contado solo en los productos que quieras modificar." + usuario_msg)
             edit_status_label.configure(foreground="green")
 
         except Exception as e:
@@ -1910,11 +2603,13 @@ def main():
         try:
             pallets_actuales = int(vals[2])
             packs_actuales = int(vals[3])
-            pallets_nuevos = safe_int(vals[4], "Pallets nuevos")
-            packs_nuevos = safe_int(vals[5], "Packs nuevos")
 
-            diff_p = pallets_nuevos - pallets_actuales
-            diff_pk = packs_nuevos - packs_actuales
+            pallets_reales = safe_int(vals[4], "Ajuste pallets")
+            packs_reales = safe_int(vals[5], "Ajuste packs")
+
+            # Como se ingresa el total real contado, calculamos la diferencia contra el stock actual.
+            diff_p = pallets_reales - pallets_actuales
+            diff_pk = packs_reales - packs_actuales
 
             vals[6] = format_diff(diff_p, diff_pk)
 
@@ -1929,11 +2624,12 @@ def main():
             editor_tree.tag_configure("sin_stock", background="#ffffff")
 
             cambios = get_editor_changes(validar=False)
+
             if cambios:
-                edit_status_var.set(f"✏️ Hay {len(cambios)} cambio(s) pendiente(s).")
+                edit_status_var.set(f"✏️ Hay {len(cambios)} ajuste(s) pendiente(s).")
                 edit_status_label.configure(foreground="#b7791f")
             else:
-                edit_status_var.set("Sin cambios pendientes.")
+                edit_status_var.set("Sin ajustes pendientes.")
                 edit_status_label.configure(foreground="gray")
 
         except Exception as e:
@@ -1941,18 +2637,23 @@ def main():
             editor_tree.item(item_id, values=vals, tags=("error",))
             editor_tree.tag_configure("error", background="#f8d7da")
 
-    def editar_celda_editor(event):
-        region = editor_tree.identify("region", event.x, event.y)
+    def get_next_editable_cell(row_id, col_id):
+        children = list(editor_tree.get_children())
 
-        if region != "cell":
-            return
+        if row_id not in children:
+            return None, None
 
-        row_id = editor_tree.identify_row(event.y)
-        col_id = editor_tree.identify_column(event.x)
+        row_index = children.index(row_id)
 
-        # Columnas editables:
-        # #5 = pallets_nuevos
-        # #6 = packs_nuevos
+        if col_id == "#5":
+            return row_id, "#6"
+
+        if col_id == "#6" and row_index + 1 < len(children):
+            return children[row_index + 1], "#5"
+
+        return None, None
+
+    def abrir_editor_celda(row_id, col_id):
         if not row_id or col_id not in ("#5", "#6"):
             return
 
@@ -1966,24 +2667,36 @@ def main():
         current_values = list(editor_tree.item(row_id, "values"))
         current_value = current_values[col_index]
 
-        editor = tb.Entry(editor_tree, width=max(8, int(width / 10)))
+        editor = tk.Entry(
+            editor_tree,
+            font=("Segoe UI", 10),
+            justify="center",
+            bg="white",
+            fg="black",
+            insertbackground="black",
+            relief="solid",
+            bd=1
+        )
         editor.insert(0, str(current_value))
         editor.select_range(0, "end")
         editor.place(x=x, y=y, width=width, height=height)
+        editor.lift()
         editor.focus_set()
 
-        def save_edit(event=None):
+        def save_edit(move_next=False):
             new_value = editor.get().strip()
 
             try:
-                safe_int(new_value, "stock nuevo")
+                safe_int(new_value, "ajuste de stock")
                 vals = list(editor_tree.item(row_id, "values"))
                 vals[col_index] = new_value
                 editor_tree.item(row_id, values=vals)
+                editor_items_editados.add(row_id)
                 recalcular_diferencia_item(row_id)
 
             except Exception as e:
                 messagebox.showerror("Valor inválido", str(e), parent=root)
+                return
 
             finally:
                 try:
@@ -1991,14 +2704,48 @@ def main():
                 except Exception:
                     pass
 
-        editor.bind("<Return>", save_edit)
-        editor.bind("<FocusOut>", save_edit)
+            if move_next:
+                next_row, next_col = get_next_editable_cell(row_id, col_id)
+                if next_row and next_col:
+                    root.after(20, lambda: abrir_editor_celda(next_row, next_col))
+
+        def on_return(event=None):
+            save_edit(move_next=False)
+            return "break"
+
+        def on_tab(event=None):
+            save_edit(move_next=True)
+            return "break"
+
+        def on_focus_out(event=None):
+            save_edit(move_next=False)
+
+        editor.bind("<Return>", on_return)
+        editor.bind("<Tab>", on_tab)
+        editor.bind("<FocusOut>", on_focus_out)
         editor.bind("<Escape>", lambda e: editor.destroy())
+
+    def editar_celda_editor(event):
+        region = editor_tree.identify("region", event.x, event.y)
+
+        if region != "cell":
+            return
+
+        row_id = editor_tree.identify_row(event.y)
+        col_id = editor_tree.identify_column(event.x)
+
+        if not row_id or col_id not in ("#5", "#6"):
+            return
+
+        abrir_editor_celda(row_id, col_id)
 
     def get_editor_changes(validar=True):
         cambios = []
 
         for item in editor_tree.get_children():
+            if item not in editor_items_editados:
+                continue
+
             vals = list(editor_tree.item(item, "values"))
 
             if len(vals) < 7:
@@ -2009,24 +2756,29 @@ def main():
                 desc = str(vals[1])
                 pallets_actuales = int(vals[2])
                 packs_actuales = int(vals[3])
-                pallets_nuevos = safe_int(vals[4], f"Pallets nuevos del producto {pid}")
-                packs_nuevos = safe_int(vals[5], f"Packs nuevos del producto {pid}")
 
-                if pallets_nuevos != pallets_actuales or packs_nuevos != packs_actuales:
+                nuevo_pallets = safe_int(vals[4], f"Ajuste pallets del producto {pid}")
+                nuevo_packs = safe_int(vals[5], f"Ajuste packs del producto {pid}")
+
+                diff_pallets = nuevo_pallets - pallets_actuales
+                diff_packs = nuevo_packs - packs_actuales
+
+                if diff_pallets != 0 or diff_packs != 0:
                     cambios.append({
                         "id_producto": pid,
                         "descripcion": desc,
                         "pallets_actuales": pallets_actuales,
                         "packs_actuales": packs_actuales,
-                        "nuevo_pallets": pallets_nuevos,
-                        "nuevo_packs": packs_nuevos,
-                        "diff_pallets": pallets_nuevos - pallets_actuales,
-                        "diff_packs": packs_nuevos - packs_actuales,
+                        "nuevo_pallets": nuevo_pallets,
+                        "nuevo_packs": nuevo_packs,
+                        "diff_pallets": diff_pallets,
+                        "diff_packs": diff_packs,
                     })
 
             except Exception:
                 if validar:
                     raise
+
                 continue
 
         return cambios
@@ -2043,8 +2795,8 @@ def main():
             lineas.append(
                 f"[{c['id_producto']}] {c['descripcion']}\n"
                 f"  Actual: {c['pallets_actuales']} pallets / {c['packs_actuales']} packs\n"
-                f"  Nuevo:  {c['nuevo_pallets']} pallets / {c['nuevo_packs']} packs\n"
-                f"  Dif.:   {format_diff(c['diff_pallets'], c['diff_packs'])}\n"
+                f"  Ajuste: {format_diff(c['diff_pallets'], c['diff_packs'])}\n"
+                f"  Final:  {c['nuevo_pallets']} pallets / {c['nuevo_packs']} packs\n"
             )
 
         if len(cambios) > 15:
@@ -2057,6 +2809,12 @@ def main():
         return "\n".join(lineas)
 
     def enviar_todos_los_cambios():
+        usuario_actual = USUARIO_AJUSTE_ACTUAL
+
+        if not usuario_actual:
+            messagebox.showerror("Usuario no identificado", "Tenés que ingresar con usuario y contraseña para realizar ajustes.", parent=root)
+            return
+
         try:
             cambios = get_editor_changes(validar=True)
 
@@ -2065,11 +2823,11 @@ def main():
             return
 
         if not cambios:
-            messagebox.showinfo("Sin cambios", "No hay cambios pendientes para enviar.", parent=root)
+            messagebox.showinfo("Sin cambios", "No hay cambios pendientes para ajustar.", parent=root)
             return
 
         confirm = messagebox.askyesno(
-            "Confirmar envío de ajustes",
+            "Confirmar ajuste de stock",
             build_confirmacion_cambios(cambios),
             parent=root
         )
@@ -2080,37 +2838,30 @@ def main():
             return
 
         try:
-            btn_enviar_cambios.configure(state="disabled", text="Procesando...")
+            btn_enviar_cambios.configure(state="disabled", text="REALIZANDO AJUSTE...")
             btn_refresh_editor.configure(state="disabled")
             btn_descartar_cambios.configure(state="disabled")
             root.update_idletasks()
 
-            resultados = set_stock_lote(conn, cambios)
+            resultados = set_stock_lote(conn, cambios, usuario_actual)
 
             if not resultados:
                 edit_status_var.set("ℹ️ No hubo cambios para aplicar.")
                 edit_status_label.configure(foreground="gray")
                 return
 
-            for cambio in resultados:
-                _sync_google_stock_async(
-                    cambio["id_producto"],
-                    cambio["descripcion"],
-                    cambio["pallets_despues"],
-                    cambio["packs_despues"]
-                )
-
+            auto_sync_bulk_debounced(on_warn=append_status, delay_seconds=1.0)
             send_stock_changes_email_async(resultados)
 
             edit_status_var.set(
-                f"✅ Se aplicaron {len(resultados)} ajuste(s). "
+                f"✅ Se aplicaron {len(resultados)} ajuste(s) por {usuario_actual}. "
                 f"Se está sincronizando Google Sheet y enviando el mail a {EMAIL_AJUSTES_TO}."
             )
             edit_status_label.configure(foreground="green")
 
             set_status(
                 f"✅ Ajustes de stock aplicados: {len(resultados)} producto(s).\n"
-                f"Se está sincronizando Google Sheet y enviando el mail a {EMAIL_AJUSTES_TO}."
+                f"Se está sincronizando Google Sheet automáticamente y enviando el mail a {EMAIL_AJUSTES_TO}."
             )
 
             refresh_editor_tree()
@@ -2123,16 +2874,18 @@ def main():
             messagebox.showerror("Error al aplicar ajustes", str(e), parent=root)
 
         finally:
-            btn_enviar_cambios.configure(state="normal", text="ENVIAR TODOS LOS CAMBIOS")
+            btn_enviar_cambios.configure(state="normal", text="REALIZAR AJUSTE")
             btn_refresh_editor.configure(state="normal")
             btn_descartar_cambios.configure(state="normal")
 
-    editor_tree.bind("<Double-1>", editar_celda_editor)
+    editor_tree.bind("<ButtonRelease-1>", editar_celda_editor)
     btn_enviar_cambios.configure(command=enviar_todos_los_cambios)
     btn_descartar_cambios.configure(command=refresh_editor_tree)
     btn_refresh_editor.configure(command=refresh_editor_tree)
 
     def bloquear_editor():
+        global USUARIO_AJUSTE_ACTUAL
+        USUARIO_AJUSTE_ACTUAL = None
         editor_unlocked["value"] = False
         editor_frame.place_forget()
         lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -2140,11 +2893,16 @@ def main():
     btn_lock_editor.configure(command=bloquear_editor)
 
     def desbloquear_editor():
-        if pedir_contrasena(root):
+        global USUARIO_AJUSTE_ACTUAL
+        usuario_login = pedir_contrasena(root, conn)
+
+        if usuario_login:
+            USUARIO_AJUSTE_ACTUAL = usuario_login
             editor_unlocked["value"] = True
             lock_frame.place_forget()
             editor_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
             refresh_editor_tree()
+
         else:
             notebook.select(0)
 
@@ -2160,12 +2918,44 @@ def main():
     # =========================================================
     # FUNCIONES BAJAS
     # =========================================================
+    def actualizar_disponible_lote(event=None):
+        """
+        Muestra cuánto stock real hay disponible en la tabla stock
+        para el producto + lote seleccionado.
+        """
+
+        try:
+            val = prod_var.get()
+            lote_sel = lote_var.get().strip()
+
+            if not val or not lote_sel:
+                disponibilidad_lote_var.set("Disponible en stock: -")
+                return
+
+            pid = int(val.split(" - ")[0])
+            pallets_disp, packs_disp = get_stock_disponible_lote_resumen(conn, pid, lote_sel)
+
+            tipo_actual = type_var.get().strip().lower()
+
+            if tipo_actual == "pallet":
+                disponibilidad_lote_var.set(
+                    f"Disponible en stock: {pallets_disp} PALLET | Packs: {packs_disp}"
+                )
+            else:
+                disponibilidad_lote_var.set(
+                    f"Disponible en stock: {packs_disp} PACKS | Pallets: {pallets_disp}"
+                )
+
+        except Exception as e:
+            disponibilidad_lote_var.set(f"Disponible en stock: error ({e})")
+
     def on_product_select(event=None):
         val = prod_var.get()
 
         if not val:
             lote_combo["values"] = []
             lote_var.set("")
+            actualizar_disponible_lote()
             return
 
         try:
@@ -2173,24 +2963,31 @@ def main():
             lotes = get_lotes_for_product(conn, pid)
             lote_combo["values"] = lotes
             lote_var.set(lotes[0] if lotes else "")
+            actualizar_disponible_lote()
 
         except Exception:
             lote_combo["values"] = []
             lote_var.set("")
+            actualizar_disponible_lote()
 
     prod_combo.bind("<<ComboboxSelected>>", on_product_select)
+    lote_combo.bind("<<ComboboxSelected>>", actualizar_disponible_lote)
+    type_var.trace_add("write", lambda *_: actualizar_disponible_lote())
 
     def refresh_product_combo():
         current_value = prod_var.get()
 
         new_prods = get_products_with_stock(conn)
         new_options = [f"{pid} - {desc}" for pid, desc in new_prods]
+
         prod_combo["values"] = new_options
 
         if current_value in new_options:
             prod_var.set(current_value)
+
         elif new_options:
             prod_var.set(new_options[0])
+
         else:
             prod_var.set("")
 
@@ -2213,7 +3010,6 @@ def main():
                 raise ValueError("Seleccioná un producto.")
 
             pid = int(pstr.split(" - ")[0])
-
             lote = lote_var.get().strip()
 
             if not lote:
@@ -2237,8 +3033,23 @@ def main():
             if motivo == "Venta" and not cliente:
                 raise ValueError("Debes seleccionar o escribir un cliente cuando el motivo es Venta.")
 
+            tipo_unidad_previa = "PALLET" if tipo == "pallet" else "PACKS"
+
+            disponible = get_stock_disponible_lote_tipo(
+                conn,
+                pid,
+                lote,
+                tipo_unidad_previa
+            )
+
+            if disponible < qty:
+                raise ValueError(
+                    f"No hay stock suficiente para dar de baja. "
+                    f"Disponible para {tipo_unidad_previa} en este lote: {disponible}."
+                )
+
             (
-                baja_id,
+                bajas_ids,
                 pid,
                 desc,
                 lote,
@@ -2267,6 +3078,7 @@ def main():
 
             if series_afectadas:
                 detalle_series = ", ".join(series_afectadas[:12])
+
                 if len(series_afectadas) > 12:
                     detalle_series += ", ..."
             else:
@@ -2274,18 +3086,21 @@ def main():
 
             msg = (
                 f"✅ Baja registrada correctamente\n"
-                f"ID baja: {baja_id} | Producto: {pid} – {desc}\n"
-                f"Lote: {lote} | Tipo: {tipo_unidad} | Cantidad: {cantidad}\n"
+                f"IDs bajas: {format_bajas_ids(bajas_ids)} | Producto: {pid} – {desc}\n"
+                f"Lote: {lote} | Tipo: {tipo_unidad} | Cantidad: {cantidad} registro(s) movidos de stock a bajas\n"
                 f"Motivo: {motivo} | Cliente: {cliente_txt}\n"
                 f"Observaciones: {obs_txt}\n"
                 f"Series afectadas: {detalle_series}\n"
-                f"Stock restante → Pallets: {net_p} | Packs: {net_pk}"
+                f"Stock restante → Pallets: {net_p} | Packs: {net_pk}\n"
+                f"Google Sheet sincronizando automáticamente."
             )
 
             if cliente_creado:
                 msg += f"\n🆕 Cliente agregado a la base: {cliente_final}"
 
             set_status(msg)
+
+            sync_sheet_now_async()
 
             refresh_product_combo()
             refresh_stock_box()
@@ -2294,9 +3109,16 @@ def main():
         except Exception as e:
             set_status(f"❌ Error al registrar la baja: {e}")
 
+    last_tab_index = {"value": notebook.index(notebook.select())}
+
     def on_tab_changed(event=None):
         try:
             current_index = notebook.index(notebook.select())
+            previous_index = last_tab_index["value"]
+
+            # Si estaba en Ajuste de stock y se va a otra pestaña, se bloquea.
+            if previous_index == 2 and current_index != 2:
+                bloquear_editor()
 
             if current_index == 1:
                 refresh_stock_box()
@@ -2305,8 +3127,11 @@ def main():
                 if not editor_unlocked["value"]:
                     desbloquear_editor()
 
+            last_tab_index["value"] = notebook.index(notebook.select())
+
         except Exception:
             pass
+
 
     btn_send.configure(command=submit_manual)
     btn_refresh_stock.configure(command=refresh_stock_box)
@@ -2320,6 +3145,28 @@ def main():
     refresh_client_combo_values()
     update_cliente_visibility()
     refresh_stock_box()
+
+    # Sincronización inicial al abrir salida.py.
+    # Esto deja el Google Sheet alineado con produccion.stock aunque no se haga ninguna baja.
+    auto_sync_bulk_debounced(on_warn=append_status, delay_seconds=1.0)
+
+    def on_close():
+        global _bulk_sync_timer
+
+        try:
+            if _bulk_sync_timer is not None:
+                _bulk_sync_timer.cancel()
+        except Exception:
+            pass
+
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 

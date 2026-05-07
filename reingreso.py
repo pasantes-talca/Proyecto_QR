@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 MOTIVOS = ("Venta", "Calidad", "Desarme", "Observacion")
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwwzMiTB7DEbcOdvi5Vl32xF-McguAlgkzcBQoeAGhzlowc5J1PjF1QLChNcukf5fbn/exec"
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwWisnYakHygj12AhHTggRS2ugLDV5jXmxPYiQsdvVUwCkCEjLZySXYpMa1hQhpSUSJ/exec"
 
 def get_app_dir():
     return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
@@ -39,7 +39,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 DEFAULT_PG = {
     "host":"10.242.4.13",
     "port": 5432,
-    "dbname": "stock_copia",
+    "dbname": "stock",
     "user": "postgres",
     "password": "Talca2025",
     "client_encoding": "WIN1252",
@@ -201,7 +201,7 @@ def _descontar_bajas(cur, schema, tbajas, id_producto, lote,
 
 # ── GOOGLE SHEETS SYNC (se usa en background) ─────────────────────────────────
 def sync_sheet_after_reingreso(conn):
-    url = APPS_SCRIPT_URL
+    url = "https://script.google.com/macros/s/AKfycbwWisnYakHygj12AhHTggRS2ugLDV5jXmxPYiQsdvVUwCkCEjLZySXYpMa1hQhpSUSJ/exec"
     if not url or "TU_ID_AQUI" in url:
         log.warning("APPS_SCRIPT_URL no configurada.")
         return False, "URL de Apps Script no configurada."
