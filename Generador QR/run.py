@@ -1,0 +1,24 @@
+"""
+Punto de entrada alternativo.
+Ejecutar desde la raíz del proyecto con:
+
+    python run.py
+
+Equivalente a:
+    uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+"""
+import sys
+import os
+
+# Asegura que la raíz del proyecto esté en el path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
