@@ -13,7 +13,7 @@ from ttkbootstrap.constants import *
 # =======================
 # GOOGLE SHEET WEBAPP
 # =======================
-SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbwWisnYakHygj12AhHTggRS2ugLDV5jXmxPYiQsdvVUwCkCEjLZySXYpMa1hQhpSUSJ/exec"
+SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbyBxCyZMyEeFi_fdsRu-SjnZHktTH4XNF3APKaJJsnqoesgTKjZ8sSqF_O6NDwXa77s9Q/exec"
 SHEETS_API_KEY = "TALCA-QR-2026"
 
 try:
@@ -37,7 +37,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 DEFAULT_PG = {
     "host": "10.242.4.13",
     "port": 5432,
-    "dbname": "stock",
+    "dbname": "stock_copia",
     "user": "postgres",
     "password": "Talca2025",
     "client_encoding": "WIN1252",
