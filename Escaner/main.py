@@ -6,6 +6,12 @@ from pathlib import Path
 import json
 import os
 import sys
+import smtplib
+import logging
+import threading
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 
 # ==========================================
 # RUTAS ABSOLUTAS (evita problemas de CWD)
@@ -31,6 +37,67 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # Inicializar Jinja2 con ruta absoluta
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+logger = logging.getLogger("stock_qr")
+
+
+# ── Envío de email ─────────────────────────────────────────────────────────────
+def send_email(id_producto: int, nro_serie: int) -> None:
+    """Envía un correo con el producto y número de serie escaneado."""
+    from config import (
+        EMAIL_SMTP_HOST, EMAIL_SMTP_PORT,
+        EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD,
+        EMAIL_FROM, EMAIL_TO, EMAIL_USE_TLS,
+    )
+    try:
+        ahora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        asunto = f"[Stock] Ingreso QR – Producto {id_producto} | Serie {nro_serie}"
+
+        cuerpo_html = f"""
+        <html><body style="font-family:Arial,sans-serif;font-size:15px;color:#333;">
+          <h2 style="color:#667eea;">&#128230; Nuevo ingreso de stock registrado</h2>
+          <p><strong>Fecha y hora:</strong> {ahora}</p>
+          <table border="0" cellpadding="10" cellspacing="0"
+                 style="border-collapse:collapse;width:100%;max-width:420px;
+                        border:1px solid #ddd;border-radius:8px;">
+            <tr style="background:#f0f4ff;">
+              <td style="width:140px;"><strong>Producto ID</strong></td>
+              <td>{id_producto}</td>
+            </tr>
+            <tr>
+              <td><strong>Número de serie</strong></td>
+              <td>{nro_serie}</td>
+            </tr>
+          </table>
+          <p style="margin-top:20px;color:#aaa;font-size:11px;">
+            Mensaje automático – Sistema de Escaneo QR Stock
+          </p>
+        </body></html>
+        """
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = asunto
+        msg["From"]    = EMAIL_FROM
+        msg["To"]      = EMAIL_TO
+        msg.attach(MIMEText(cuerpo_html, "html", "utf-8"))
+
+        destinatarios = [e.strip() for e in EMAIL_TO.split(",") if e.strip()]
+
+        if EMAIL_USE_TLS:
+            servidor = smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=10)
+            servidor.ehlo()
+            servidor.starttls()
+            servidor.ehlo()
+        else:
+            servidor = smtplib.SMTP_SSL(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=10)
+
+        servidor.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASSWORD)
+        servidor.sendmail(EMAIL_FROM, destinatarios, msg.as_bytes())
+        servidor.quit()
+        logger.info(f"✉️  Email enviado – Producto {id_producto} | Serie {nro_serie}")
+
+    except Exception as exc:
+        logger.warning(f"⚠️  No se pudo enviar el email: {exc}")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -170,6 +237,13 @@ async def scan_qr(request: Request):
                     autofill_msg = f"Autocompletados {autofill_count} ({inicio}→{qr_data['nro_serie'] - 1})"
                 else:
                     autofill_msg = f"⚠️ Gap demasiado grande ({gap}), sin autocompletar"
+
+            # ── Enviar email en segundo plano ──────────────────────────────
+            threading.Thread(
+                target=send_email,
+                args=(qr_data["id_producto"], qr_data["nro_serie"]),
+                daemon=True
+            ).start()
 
             return JSONResponse(content={
                 "ok":       True,
