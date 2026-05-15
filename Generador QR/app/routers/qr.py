@@ -8,6 +8,7 @@ from fastapi.responses import Response
 
 from app.schemas.models import GenerateRequest
 from app.services.pdf_service import generate_pdf
+from app.services.email_service import send_email_async
 
 router = APIRouter(prefix="/api/qr", tags=["Generación QR"])
 
@@ -40,6 +41,15 @@ def generate_qr_pdf(req: GenerateRequest) -> Response:
             detail=f"Error al generar el PDF: {exc}",
         )
 
+    # ── Notificación por email (no bloquea la descarga) ───────────────────────
+    send_email_async(
+        product_id=req.product_id,
+        descripcion=req.descripcion,
+        cantidad=req.cantidad,
+        ultimo_serie=last_serie,
+        lote=lote,
+    )
+
     filename = f"qr_lote_{lote}.pdf"
 
     return Response(
@@ -53,4 +63,4 @@ def generate_qr_pdf(req: GenerateRequest) -> Response:
             "X-Filename": filename,
             "Access-Control-Expose-Headers": "X-Last-Serie, X-Lote, X-Filename",
         },
-    )
+    )
